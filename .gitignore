@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# PyInstaller の出力 (build.bat / build_mac.sh で作り直せる)
+python/build/
+python/dist/
+
+# OS
+.DS_Store
+Thumbs.db

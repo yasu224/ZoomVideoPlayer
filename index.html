@@ -1,0 +1,656 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zoom Video Player</title>
+<style>
+  :root {
+    --bg: #111317;
+    --panel: #1b1e24;
+    --line: #2c313a;
+    --text: #e6e8eb;
+    --muted: #9aa1ab;
+    --accent: #4da3ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 "Segoe UI", "Yu Gothic UI", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  button, select, input { font: inherit; color: var(--text); }
+  button, select {
+    background: #262a32; border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 10px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: #46505e; }
+  button:disabled { opacity: .45; cursor: default; }
+  label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+
+  header, .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 8px 12px; background: var(--panel); border-color: var(--line);
+  }
+  header { border-bottom: 1px solid var(--line); }
+  .controls { border-top: 1px solid var(--line); }
+  header .title { font-weight: 600; margin-right: 8px; }
+  header .name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+  .spacer { flex: 1; }
+
+  #stage {
+    position: relative; flex: 1; overflow: hidden; background: #000;
+    cursor: crosshair; user-select: none; touch-action: none;
+  }
+  #stage.panning { cursor: grabbing; }
+  #video {
+    position: absolute; left: 0; top: 0; transform-origin: 0 0;
+    pointer-events: none; display: block;
+  }
+  #stage.pixelated #video { image-rendering: pixelated; }
+  #selRect {
+    position: absolute; border: 1px dashed var(--accent); background: rgba(77,163,255,.15);
+    pointer-events: none; display: none;
+  }
+  #drop {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 10px; color: var(--muted);
+    text-align: center; padding: 16px;
+  }
+  #drop strong { color: var(--text); font-size: 16px; }
+  #stage.dragover #drop { background: rgba(77,163,255,.12); outline: 2px dashed var(--accent); outline-offset: -12px; }
+  #minimap {
+    position: absolute; right: 12px; bottom: 12px; border: 1px solid #555;
+    background: #000; display: none; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.6);
+  }
+  #zoomBadge {
+    position: absolute; left: 12px; top: 12px; padding: 3px 8px; border-radius: 4px;
+    background: rgba(0,0,0,.6); font-variant-numeric: tabular-nums; display: none;
+  }
+  #fpsBadge {
+    position: absolute; right: 12px; top: 12px; padding: 3px 8px; border-radius: 4px;
+    background: rgba(0,0,0,.6); font-variant-numeric: tabular-nums; display: none;
+    pointer-events: none; text-align: right;
+  }
+  #fpsBadge.limited { color: #ffb84d; }
+  #fpsBadge small { display: block; color: var(--muted); }
+
+  #seek { flex: 1 1 240px; min-width: 120px; accent-color: var(--accent); }
+  #vol { width: 80px; accent-color: var(--accent); }
+  .time { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 230px; text-align: center; }
+  button.on { background: #1f4a7a; border-color: var(--accent); }
+  .seekwrap { position: relative; flex: 1 1 240px; min-width: 120px; display: flex; }
+  .seekwrap #seek { flex: 1; min-width: 0; }
+  #abRange {
+    position: absolute; top: 50%; height: 6px; margin-top: -3px; pointer-events: none;
+    background: rgba(255,196,0,.55); border-radius: 3px; display: none;
+  }
+
+  details.help { position: relative; }
+  details.help summary { cursor: pointer; color: var(--muted); list-style: none; padding: 5px 8px; }
+  details.help[open] .help-body {
+    position: absolute; right: 0; top: 30px; z-index: 10; width: 320px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  }
+  .help-body table { border-collapse: collapse; width: 100%; }
+  .help-body td { padding: 2px 4px; vertical-align: top; }
+  .help-body td:first-child { color: var(--accent); white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Zoom Video Player</span>
+  <button id="openBtn">動画を開く</button>
+  <input id="fileInput" type="file" accept="video/*,.mxf,.mkv,.mov" hidden>
+  <span class="name" id="fileName"></span>
+  <span class="spacer"></span>
+  <label><input type="checkbox" id="pixelated"> ピクセル表示</label>
+  <label><input type="checkbox" id="showMini" checked> ミニマップ</label>
+  <details class="help">
+    <summary>操作方法 ▾</summary>
+    <div class="help-body">
+      <table>
+        <tr><td>左ドラッグ</td><td>範囲を選んで拡大</td></tr>
+        <tr><td>ホイール</td><td>カーソル位置を中心に拡大/縮小</td></tr>
+        <tr><td>右ドラッグ / Ctrl+ドラッグ</td><td>拡大中の表示を移動</td></tr>
+        <tr><td>ダブルクリック / Esc / 0</td><td>全体表示に戻す</td></tr>
+        <tr><td>Backspace</td><td>1つ前の拡大状態に戻る</td></tr>
+        <tr><td>Space / K</td><td>再生 / 一時停止</td></tr>
+        <tr><td>← / →</td><td>5秒戻る / 進む</td></tr>
+        <tr><td>, / .</td><td>1フレーム戻る / 進む</td></tr>
+        <tr><td>L</td><td>ループ再生 ON / OFF</td></tr>
+        <tr><td>[ / ]</td><td>区間ループの開始点 A / 終了点 B を現在位置に設定</td></tr>
+        <tr><td>\</td><td>区間ループ解除</td></tr>
+        <tr><td>+ / -</td><td>中央を基準に拡大 / 縮小</td></tr>
+        <tr><td>矢印↑↓</td><td>音量</td></tr>
+        <tr><td>F</td><td>フルスクリーン</td></tr>
+        <tr><td>ミニマップをクリック</td><td>その位置へ移動</td></tr>
+      </table>
+    </div>
+  </details>
+</header>
+
+<div id="stage">
+  <video id="video" preload="auto"></video>
+  <div id="selRect"></div>
+  <div id="drop">
+    <strong>動画ファイルをここにドロップ</strong>
+    <span>または上の「動画を開く」から選択</span>
+  </div>
+  <div id="zoomBadge"></div>
+  <div id="fpsBadge"></div>
+  <canvas id="minimap"></canvas>
+</div>
+
+<div class="controls">
+  <button id="playBtn" disabled>▶ 再生</button>
+  <button id="prevFrame" disabled title="1フレーム戻る (,)">◀|</button>
+  <button id="nextFrame" disabled title="1フレーム進む (.)">|▶</button>
+  <div class="seekwrap">
+    <input id="seek" type="range" min="0" max="10000" step="1" value="0" disabled>
+    <div id="abRange"></div>
+  </div>
+  <span class="time" id="time">00:00.000 / 00:00.000</span>
+  <label>fps
+    <select id="fps" title="フレームレート (コマ送り・フレーム番号に使用)">
+      <option value="auto" selected>自動</option>
+      <option value="23.976">23.976</option>
+      <option value="24">24</option>
+      <option value="25">25</option>
+      <option value="29.97">29.97</option>
+      <option value="30">30</option>
+      <option value="50">50</option>
+      <option value="59.94">59.94</option>
+      <option value="60">60</option>
+      <option value="119.88">119.88</option>
+      <option value="120">120</option>
+      <option value="240">240</option>
+    </select>
+  </label>
+  <button id="loopBtn" title="ループ再生 (L)">🔁 ループ</button>
+  <button id="setA" disabled title="区間ループの開始点 ([)">A</button>
+  <button id="setB" disabled title="区間ループの終了点 (])">B</button>
+  <button id="clearAB" disabled title="区間ループ解除 (\)">A-B解除</button>
+  <select id="speed" title="再生速度">
+    <option value="0.1">0.1x</option>
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="1.5">1.5x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+  </select>
+  <button id="muteBtn">🔊</button>
+  <input id="vol" type="range" min="0" max="1" step="0.01" value="1">
+  <button id="zoomOut" title="縮小 (-)">－</button>
+  <button id="zoomIn" title="拡大 (+)">＋</button>
+  <button id="resetBtn" title="全体表示 (Esc)">全体表示</button>
+  <button id="fsBtn" title="フルスクリーン (F)">⛶</button>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const stage = $('stage'), video = $('video'), selRect = $('selRect'), drop = $('drop');
+  const minimap = $('minimap'), mctx = minimap.getContext('2d'), zoomBadge = $('zoomBadge');
+  const playBtn = $('playBtn'), seek = $('seek'), timeEl = $('time');
+
+  const MAX_ZOOM = 64;     // relative to fit
+  const MINI_W = 220;
+
+  // View transform: screen = video_px * s + (tx, ty)
+  const view = { s: 1, tx: 0, ty: 0 };
+  let history = [];
+  let objectUrl = null;
+
+  const vw = () => video.videoWidth || 0;
+  const vh = () => video.videoHeight || 0;
+  const hasVideo = () => vw() > 0 && vh() > 0 && stage.clientWidth > 0 && stage.clientHeight > 0;
+  const stageSize = () => ({ W: stage.clientWidth, H: stage.clientHeight });
+  const fitScale = () => {
+    const { W, H } = stageSize();
+    return Math.min(W / vw(), H / vh());
+  };
+  const zoomLevel = () => view.s / fitScale();
+
+  function clampView() {
+    if (!hasVideo()) return;
+    const { W, H } = stageSize();
+    const s0 = fitScale();
+    view.s = Math.min(Math.max(view.s, s0), s0 * MAX_ZOOM);
+    const cw = vw() * view.s, ch = vh() * view.s;
+    view.tx = cw <= W ? (W - cw) / 2 : Math.min(0, Math.max(W - cw, view.tx));
+    view.ty = ch <= H ? (H - ch) / 2 : Math.min(0, Math.max(H - ch, view.ty));
+  }
+
+  function apply() {
+    clampView();
+    video.style.width = vw() + 'px';
+    video.style.height = vh() + 'px';
+    video.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`;
+    const z = hasVideo() ? zoomLevel() : 1;
+    const zoomed = z > 1.001;
+    zoomBadge.style.display = hasVideo() ? 'block' : 'none';
+    zoomBadge.textContent = `${z.toFixed(2)}x`;
+    minimap.style.display = zoomed && $('showMini').checked ? 'block' : 'none';
+    drawMinimap();
+  }
+
+  function pushHistory() {
+    history.push({ ...view });
+    if (history.length > 50) history.shift();
+  }
+
+  function reset(record = true) {
+    if (!hasVideo()) return;
+    if (record && zoomLevel() > 1.001) pushHistory();
+    view.s = fitScale();
+    view.tx = view.ty = 0;
+    apply();
+  }
+
+  // Zoom by factor keeping the screen point (mx, my) fixed.
+  function zoomAt(factor, mx, my) {
+    if (!hasVideo()) return;
+    const vx = (mx - view.tx) / view.s, vy = (my - view.ty) / view.s;
+    view.s *= factor;
+    clampView();
+    view.tx = mx - vx * view.s;
+    view.ty = my - vy * view.s;
+    apply();
+  }
+
+  // Zoom so the given screen rectangle fills the stage.
+  function zoomToScreenRect(x0, y0, x1, y1) {
+    const { W, H } = stageSize();
+    const ax = (Math.min(x0, x1) - view.tx) / view.s, bx = (Math.max(x0, x1) - view.tx) / view.s;
+    const ay = (Math.min(y0, y1) - view.ty) / view.s, by = (Math.max(y0, y1) - view.ty) / view.s;
+    const rw = bx - ax, rh = by - ay;
+    if (rw <= 0 || rh <= 0) return;
+    pushHistory();
+    view.s = Math.min(W / rw, H / rh);
+    clampView();
+    view.tx = W / 2 - (ax + rw / 2) * view.s;
+    view.ty = H / 2 - (ay + rh / 2) * view.s;
+    apply();
+  }
+
+  // ---------- Minimap ----------
+  function drawMinimap() {
+    if (minimap.style.display === 'none' || !hasVideo()) return;
+    const mw = MINI_W, mh = Math.round(MINI_W * vh() / vw());
+    if (minimap.width !== mw || minimap.height !== mh) { minimap.width = mw; minimap.height = mh; }
+    mctx.drawImage(video, 0, 0, mw, mh);
+    const { W, H } = stageSize();
+    const k = mw / vw();
+    const x = Math.max(0, -view.tx / view.s) * k, y = Math.max(0, -view.ty / view.s) * k;
+    const w = Math.min(vw(), W / view.s) * k, h = Math.min(vh(), H / view.s) * k;
+    mctx.fillStyle = 'rgba(0,0,0,.45)';
+    mctx.fillRect(0, 0, mw, y);
+    mctx.fillRect(0, y + h, mw, mh - y - h);
+    mctx.fillRect(0, y, x, h);
+    mctx.fillRect(x + w, y, mw - x - w, h);
+    mctx.strokeStyle = '#4da3ff';
+    mctx.lineWidth = 2;
+    mctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  }
+
+  function centerOnMinimap(e) {
+    const r = minimap.getBoundingClientRect();
+    const k = vw() / r.width;
+    const cx = (e.clientX - r.left) * k, cy = (e.clientY - r.top) * k;
+    const { W, H } = stageSize();
+    view.tx = W / 2 - cx * view.s;
+    view.ty = H / 2 - cy * view.s;
+    apply();
+  }
+  let miniDrag = false;
+  minimap.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    miniDrag = true;
+    minimap.setPointerCapture(e.pointerId);
+    centerOnMinimap(e);
+  });
+  minimap.addEventListener('pointermove', (e) => { if (miniDrag) centerOnMinimap(e); });
+  minimap.addEventListener('pointerup', () => { miniDrag = false; });
+
+  // Keep minimap, time display and A-B loop live while playing
+  (function loop() {
+    if (!video.paused) {
+      enforceABLoop();
+      drawMinimap();
+      updateTime();
+    }
+    requestAnimationFrame(loop);
+  })();
+
+  // ---------- Mouse interaction on stage ----------
+  let drag = null;
+  const local = (e) => {
+    const r = stage.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
+  stage.addEventListener('contextmenu', (e) => e.preventDefault());
+  stage.addEventListener('pointerdown', (e) => {
+    if (!hasVideo()) return;
+    const p = local(e);
+    const pan = e.button === 2 || e.button === 1 || (e.button === 0 && e.ctrlKey);
+    if (!pan && e.button !== 0) return;
+    e.preventDefault();
+    stage.setPointerCapture(e.pointerId);
+    drag = { mode: pan ? 'pan' : 'select', x0: p.x, y0: p.y, tx: view.tx, ty: view.ty, moved: false };
+    if (pan) stage.classList.add('panning');
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const p = local(e);
+    const dx = p.x - drag.x0, dy = p.y - drag.y0;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    if (drag.mode === 'pan') {
+      view.tx = drag.tx + dx;
+      view.ty = drag.ty + dy;
+      apply();
+    } else if (drag.moved) {
+      Object.assign(selRect.style, {
+        display: 'block',
+        left: Math.min(p.x, drag.x0) + 'px', top: Math.min(p.y, drag.y0) + 'px',
+        width: Math.abs(dx) + 'px', height: Math.abs(dy) + 'px',
+      });
+    }
+  });
+  stage.addEventListener('pointerup', (e) => {
+    if (!drag) return;
+    const p = local(e);
+    selRect.style.display = 'none';
+    stage.classList.remove('panning');
+    if (drag.mode === 'select' && Math.abs(p.x - drag.x0) > 8 && Math.abs(p.y - drag.y0) > 8) {
+      zoomToScreenRect(drag.x0, drag.y0, p.x, p.y);
+    }
+    drag = null;
+  });
+  stage.addEventListener('dblclick', () => reset());
+  stage.addEventListener('wheel', (e) => {
+    if (!hasVideo()) return;
+    e.preventDefault();
+    const p = local(e);
+    zoomAt(Math.exp(-e.deltaY * 0.0015), p.x, p.y);
+  }, { passive: false });
+
+  new ResizeObserver(() => apply()).observe(stage);
+
+  // ---------- File loading ----------
+  function load(file) {
+    if (!file) return;
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = URL.createObjectURL(file);
+    video.src = objectUrl;
+    $('fileName').textContent = file.name;
+    history = [];
+    resetFpsDetection();
+    clearAB();
+  }
+  $('openBtn').addEventListener('click', () => $('fileInput').click());
+  $('fileInput').addEventListener('change', (e) => load(e.target.files[0]));
+  ['dragenter', 'dragover'].forEach((t) => stage.addEventListener(t, (e) => {
+    e.preventDefault(); stage.classList.add('dragover');
+  }));
+  ['dragleave', 'drop'].forEach((t) => stage.addEventListener(t, (e) => {
+    e.preventDefault(); stage.classList.remove('dragover');
+  }));
+  stage.addEventListener('drop', (e) => load(e.dataTransfer.files[0]));
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
+
+  video.addEventListener('loadedmetadata', () => {
+    drop.style.display = 'none';
+    ['playBtn', 'prevFrame', 'nextFrame', 'seek', 'setA', 'setB'].forEach((id) => $(id).disabled = false);
+    reset(false);
+    updateTime();
+  });
+  video.addEventListener('error', () => {
+    drop.style.display = 'flex';
+    drop.innerHTML = '<strong>この動画は再生できません</strong><span>ブラウザが対応していない形式の可能性があります (MP4/H.264, WebM などを推奨)</span>';
+  });
+
+  // ---------- Playback controls ----------
+  const fmt = (t) => {
+    if (!isFinite(t)) t = 0;
+    const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, s = t % 60;
+    const ss = s.toFixed(3).padStart(6, '0');
+    return (h ? h + ':' + String(m).padStart(2, '0') : String(m).padStart(2, '0')) + ':' + ss;
+  };
+  // ---------- Frame rate ----------
+  const fpsSel = $('fps');
+  const COMMON_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 100, 119.88, 120, 240];
+  let detectedFps = 0, accFrames = 0, accMedia = 0, lastMediaTime = null, mediaDeltas = [];
+
+  function resetFpsDetection() {
+    detectedFps = 0;
+    accFrames = accMedia = 0;
+    lastMediaTime = null;
+    mediaDeltas = [];
+    updateFpsLabel();
+  }
+  function updateFpsLabel() {
+    fpsSel.options[0].textContent = detectedFps ? `自動 (${detectedFps})` : '自動 (未検出→30)';
+  }
+  const fps = () => fpsSel.value === 'auto' ? (detectedFps || 30) : parseFloat(fpsSel.value);
+  const frameIndex = () => Math.floor(video.currentTime * fps() + 1e-3);
+
+  // Frame rate = decoded frames per second of media time. The decoder handles every
+  // frame even when the display skips some (120fps on 60Hz), so this stays exact.
+  function addFpsSample(frames, media) {
+    accFrames += frames;
+    accMedia += media;
+    if (accMedia < 1) return;
+    let raw = accFrames / accMedia, tolerance = 0.05;
+    // Gaps between presented frame timestamps are exact multiples of the frame duration,
+    // which separates 119.88 from 120 (timing alone is too noisy for that).
+    if (mediaDeltas.length >= 10) {
+      const d = [...mediaDeltas].sort((a, b) => a - b)[mediaDeltas.length >> 1];
+      raw = Math.max(1, Math.round(d * raw)) / d;
+      tolerance = 0.0005;
+    }
+    const snap = COMMON_FPS.reduce((a, b) => Math.abs(Math.log(b / raw)) < Math.abs(Math.log(a / raw)) ? b : a);
+    const est = Math.abs(snap - raw) / raw < tolerance ? snap : Math.round(raw * 100) / 100;
+    if (est !== detectedFps) { detectedFps = est; updateFpsLabel(); updateTime(); }
+  }
+
+  // ---------- Live playback stats ----------
+  // Shows how many video frames actually reach the screen per second, next to the
+  // monitor refresh rate, so frame skipping (e.g. 120fps on 60Hz) is visible.
+  const fpsBadge = $('fpsBadge');
+  const decodedFrames = () => video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality().totalVideoFrames : 0;
+  let shownCount = 0, rafCount = 0, statsT0 = performance.now(), displayHz = 0, shownFps = 0;
+  let win = null;   // measurement window, restarted on play / seek
+
+  // warmup: the decoder runs ahead right after play/seek, so that window is not used for fps detection.
+  function startWindow(warmup = true) {
+    shownCount = 0;
+    win = video.paused ? null : { t: performance.now(), frames: decodedFrames(), media: video.currentTime, warmup };
+  }
+  function countShown(now, meta) {
+    if (!video.paused) {
+      shownCount++;
+      const d = lastMediaTime === null ? 0 : meta.mediaTime - lastMediaTime;
+      if (d > 0 && d < 0.2) {
+        mediaDeltas.push(d);
+        if (mediaDeltas.length > 120) mediaDeltas.shift();
+      }
+      lastMediaTime = meta.mediaTime;
+    } else {
+      lastMediaTime = null;
+    }
+    video.requestVideoFrameCallback(countShown);
+  }
+  if ('requestVideoFrameCallback' in video) video.requestVideoFrameCallback(countShown);
+  (function statsLoop(now) {
+    rafCount++;
+    const dt = (now - statsT0) / 1000;
+    if (dt >= 0.5) {
+      displayHz = rafCount / dt;
+      rafCount = 0;
+      statsT0 = now;
+      if (win && !video.paused && (now - win.t) / 1000 >= 0.5) {
+        const wdt = (now - win.t) / 1000;
+        const dF = decodedFrames() - win.frames, dM = video.currentTime - win.media;
+        shownFps = shownCount / wdt;
+        if (!win.warmup && dF > 0 && dM > 0.1) addFpsSample(dF, dM);
+        startWindow(false);
+      }
+      updateStats();
+    }
+    requestAnimationFrame(statsLoop);
+  })(performance.now());
+
+  function updateStats() {
+    if (!hasVideo()) { fpsBadge.style.display = 'none'; return; }
+    fpsBadge.style.display = 'block';
+    const want = fps() * video.playbackRate;
+    if (video.paused || !shownFps) {
+      fpsBadge.classList.remove('limited');
+      fpsBadge.innerHTML = `${video.paused ? '一時停止中' : '計測中…'}<small>動画 ${fps()} fps / 画面 ${Math.round(displayHz)} Hz</small>`;
+      return;
+    }
+    const limited = shownFps < want * 0.9;
+    fpsBadge.classList.toggle('limited', limited);
+    const reason = !limited ? '全コマ表示中'
+      : displayHz < want * 0.95 ? '画面の書き換え速度が上限のため間引き' : 'コマ落ち発生';
+    fpsBadge.innerHTML = `表示 ${shownFps.toFixed(1)} / ${want.toFixed(1)} fps` +
+      `<small>${reason} ・ 画面 ${Math.round(displayHz)} Hz</small>`;
+  }
+  const restartStats = () => { shownFps = 0; startWindow(); updateStats(); };
+  video.addEventListener('play', restartStats);
+  video.addEventListener('pause', restartStats);
+  video.addEventListener('ratechange', restartStats);
+  video.addEventListener('seeking', () => { win = null; lastMediaTime = null; });
+  video.addEventListener('seeked', () => startWindow());
+  fpsSel.addEventListener('change', () => { updateTime(); updateStats(); });
+  updateFpsLabel();
+
+  // ---------- Loop / A-B loop ----------
+  let loopOn = false, pointA = null, pointB = null;
+  const loopStart = () => pointA ?? 0;
+  const loopEnd = () => pointB ?? video.duration;
+
+  function updateLoopUI() {
+    // Native looping is seamless, so use it whenever the whole clip loops.
+    video.loop = loopOn && pointA === null && pointB === null;
+    $('loopBtn').classList.toggle('on', loopOn);
+    $('setA').classList.toggle('on', pointA !== null);
+    $('setB').classList.toggle('on', pointB !== null);
+    $('setA').textContent = pointA === null ? 'A' : `A ${fmt(pointA)}`;
+    $('setB').textContent = pointB === null ? 'B' : `B ${fmt(pointB)}`;
+    $('clearAB').disabled = pointA === null && pointB === null;
+    const ab = $('abRange');
+    if ((pointA !== null || pointB !== null) && video.duration) {
+      const a = loopStart() / video.duration, b = loopEnd() / video.duration;
+      ab.style.display = 'block';
+      ab.style.left = (a * 100) + '%';
+      ab.style.width = ((b - a) * 100) + '%';
+      ab.style.opacity = loopOn ? 1 : 0.4;
+    } else {
+      ab.style.display = 'none';
+    }
+  }
+  function setPoint(which) {
+    if (!hasVideo()) return;
+    const t = video.currentTime;
+    if (which === 'A') pointA = t; else pointB = t;
+    if (pointA !== null && pointB !== null && pointA > pointB) [pointA, pointB] = [pointB, pointA];
+    loopOn = true;
+    updateLoopUI();
+  }
+  function clearAB() {
+    pointA = pointB = null;
+    updateLoopUI();
+  }
+  function enforceABLoop() {
+    if (!loopOn || pointB === null) return;
+    if (video.currentTime >= pointB) video.currentTime = loopStart();
+  }
+  video.addEventListener('ended', () => {
+    if (loopOn && !video.loop) {
+      video.currentTime = loopStart();
+      video.play();
+    }
+  });
+  $('loopBtn').addEventListener('click', () => { loopOn = !loopOn; updateLoopUI(); });
+  $('setA').addEventListener('click', () => setPoint('A'));
+  $('setB').addEventListener('click', () => setPoint('B'));
+  $('clearAB').addEventListener('click', clearAB);
+  video.addEventListener('durationchange', updateLoopUI);
+
+  let seeking = false;
+  function updateTime() {
+    timeEl.textContent = `${fmt(video.currentTime)} / ${fmt(video.duration)}  #${frameIndex()}`;
+    if (!seeking && video.duration) seek.value = Math.round(video.currentTime / video.duration * 10000);
+  }
+  video.addEventListener('timeupdate', updateTime);
+  video.addEventListener('seeked', () => { updateTime(); drawMinimap(); });
+  video.addEventListener('play', () => playBtn.textContent = '⏸ 一時停止');
+  video.addEventListener('pause', () => playBtn.textContent = '▶ 再生');
+
+  const togglePlay = () => { if (hasVideo()) video.paused ? video.play() : video.pause(); };
+  const stepFrame = (n) => {
+    if (!hasVideo()) return;
+    video.pause();
+    // Seek to the middle of the target frame so rounding never lands on a neighbour.
+    const idx = Math.max(0, frameIndex() + n);
+    video.currentTime = Math.min((idx + 0.5) / fps(), video.duration || 0);
+  };
+  const skip = (sec) => { if (hasVideo()) video.currentTime = Math.min(Math.max(0, video.currentTime + sec), video.duration); };
+
+  playBtn.addEventListener('click', togglePlay);
+  $('prevFrame').addEventListener('click', () => stepFrame(-1));
+  $('nextFrame').addEventListener('click', () => stepFrame(1));
+  seek.addEventListener('input', () => {
+    seeking = true;
+    if (video.duration) video.currentTime = seek.value / 10000 * video.duration;
+  });
+  seek.addEventListener('change', () => { seeking = false; });
+  $('speed').addEventListener('change', (e) => video.playbackRate = parseFloat(e.target.value));
+  $('vol').addEventListener('input', (e) => { video.volume = e.target.value; video.muted = false; });
+  $('muteBtn').addEventListener('click', () => video.muted = !video.muted);
+  video.addEventListener('volumechange', () => {
+    $('muteBtn').textContent = video.muted || video.volume === 0 ? '🔇' : '🔊';
+    $('vol').value = video.muted ? 0 : video.volume;
+  });
+
+  const centerZoom = (f) => { const { W, H } = stageSize(); zoomAt(f, W / 2, H / 2); };
+  $('zoomIn').addEventListener('click', () => centerZoom(1.5));
+  $('zoomOut').addEventListener('click', () => centerZoom(1 / 1.5));
+  $('resetBtn').addEventListener('click', () => reset());
+  const toggleFs = () => document.fullscreenElement ? document.exitFullscreen() : document.body.requestFullscreen();
+  $('fsBtn').addEventListener('click', toggleFs);
+  $('pixelated').addEventListener('change', (e) => stage.classList.toggle('pixelated', e.target.checked));
+  $('showMini').addEventListener('change', apply);
+
+  function undoZoom() {
+    const prev = history.pop();
+    if (!prev) return reset(false);
+    Object.assign(view, prev);
+    apply();
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'SELECT') return;
+    const k = e.key;
+    const handled = {
+      ' ': togglePlay, 'k': togglePlay,
+      'ArrowLeft': () => skip(-5), 'ArrowRight': () => skip(5),
+      'ArrowUp': () => { video.muted = false; video.volume = Math.min(1, video.volume + 0.1); },
+      'ArrowDown': () => { video.volume = Math.max(0, video.volume - 0.1); },
+      ',': () => stepFrame(-1), '.': () => stepFrame(1),
+      '+': () => centerZoom(1.5), '=': () => centerZoom(1.5), '-': () => centerZoom(1 / 1.5),
+      '0': () => reset(), 'Escape': () => reset(),
+      'Backspace': undoZoom,
+      'l': () => { loopOn = !loopOn; updateLoopUI(); },
+      '[': () => setPoint('A'), ']': () => setPoint('B'), '\\': clearAB,
+      'f': toggleFs,
+    }[k.length === 1 ? k.toLowerCase() : k];
+    if (handled) { e.preventDefault(); handled(); }
+  });
+})();
+</script>
+</body>
+</html>
