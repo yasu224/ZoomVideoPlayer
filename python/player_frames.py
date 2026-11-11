@@ -199,6 +199,9 @@ class Decoder:
         self.session = 0
         self.active = False      # 実行中のセッションがある (SESSION_END 未着)
         self.params = None       # 実行中のセッションの (開始秒, fps, ループ)
+        # スロットを空きに戻す・共有メモリを閉じる前に呼ぶ。GPU 描画が裏のスレッドでスロットから
+        # 読んでいる途中なら、読み終わるまで待つ (GpuWindow.wait_copy)
+        self.before_free = None
 
     def play(self, t, fps, loop=None):
         """t 秒からデコードを始める。表示の時計は最初のコマを表示したときに合わせる。"""
@@ -235,6 +238,8 @@ class Decoder:
         return max(0, self.sent.value - self.got)
 
     def release(self, slot):
+        if self.before_free:
+            self.before_free()
         self.free_q.put(slot)
 
     def stop(self):
@@ -242,6 +247,8 @@ class Decoder:
         self.params = None
         if not self.active:
             return
+        if self.before_free:
+            self.before_free()
         self.cmd_q.put(("stop",))
         if not self.started.is_set():
             # まだ準備中なら、届いている命令を順に処理するだけで、このセッションは
@@ -262,6 +269,8 @@ class Decoder:
         self.active = False
 
     def close(self):
+        if self.before_free:
+            self.before_free()
         self.stop()
         self.cmd_q.put(("quit",))
         self.proc.join(2)

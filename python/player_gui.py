@@ -14,6 +14,7 @@ import time
 
 from player_core import END_OF_FILE, WRAP, VideoSource, even_size, gpu_format
 from player_frames import BackFiller, Decoder, FrameCache, make_picture
+import player_sdi
 from player_view import CpuView, GpuWindow, gpu_wanted
 from player_vsync import VsyncLock, VsyncTimer, vsync_lock_step
 from PySide6.QtCore import QRectF, Qt, QTimer
@@ -25,17 +26,20 @@ from PySide6.QtWidgets import (
 
 COMMON_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60, 119.88, 120, 144, 240]
 SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2, 4]
+# 時刻表示の等幅フォント。その OS にないフォント名を先に書くと、Qt が代わりを探すのに
+# 起動時 0.1 秒ほどかかるので、OS ごとにある名前だけを書く。
+MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
 STYLE = """
     QMainWindow, QWidget { background:#111317; color:#e6e8eb; }
     QWidget#bar { background:#1b1e24; }
     QLabel#dim { color:#9aa1ab; }
-    QLabel#time { color:#9aa1ab; font-family:Consolas,Menlo,monospace; }
+    QLabel#time { color:#9aa1ab; font-family:%s,monospace; }
     QPushButton, QComboBox { background:#262a32; border:1px solid #2c313a; border-radius:5px; padding:4px 10px; }
     QPushButton:hover, QComboBox:hover { border-color:#46505e; }
     QPushButton:checked { background:#1f4a7a; border-color:#4da3ff; }
     QPushButton:disabled { color:#5c626b; }
     QComboBox QAbstractItemView { background:#262a32; selection-background-color:#1f4a7a; }
-"""
+""".replace("%s", MONO_FONT)
 BACK_READY = 48   # 停止中に、表示しているコマの手前に用意しておくコマ数 (キャッシュの 2/3 まで)
 
 HELP_TEXT = """\
@@ -70,6 +74,17 @@ def fmt_time(t):
 
 def fmt_fps(f):
     return f"{f:.3f}".rstrip("0").rstrip(".")
+
+
+class SdiCombo(QComboBox):
+    """SDI 出力の選択。開くたびに機器と出力形式を読み直す (後からつないだ機器も出るように)。"""
+
+    refresh = None
+
+    def showPopup(self):
+        if self.refresh:
+            self.refresh()
+        super().showPopup()
 
 
 class SeekSlider(QSlider):
@@ -151,6 +166,9 @@ class MainWindow(QMainWindow):
         self.path = None
         self.cache = FrameCache()    # 停止中に見たコマ (戻るコマ送りを速くする)
         self.scrub_value = None      # シークバーをドラッグ中の、まだ表示していない位置
+        self.sdi = None              # SDI 出力 (player_sdi.SdiOutput)
+        self.sdi_sent_mark = 0       # 統計の表示で、前回までに送ったコマ数
+        self.stats_dt = 0.5          # 統計の表示の間隔 (秒)
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
@@ -216,6 +234,8 @@ class MainWindow(QMainWindow):
             return
         print(f"GPU 描画を使えないため CPU 描画に切り替えます: {reason}")
         self.pause()
+        self.stop_sdi()
+        self.show_sdi_off()
         old = self.view_widget
         index = self.root_layout.indexOf(old)
         self.make_view(gpu=False)
@@ -250,6 +270,16 @@ class MainWindow(QMainWindow):
         self.mini_check.setFocusPolicy(Qt.NoFocus)
         self.mini_check.toggled.connect(self.set_minimap)
         top.addWidget(self.mini_check)
+        top.addSpacing(8)
+        top.addWidget(QLabel("SDI出力"))
+        self.sdi_combo = SdiCombo()
+        self.sdi_combo.setFocusPolicy(Qt.NoFocus)
+        self.sdi_combo.setToolTip("Blackmagic の機器 (DeckLink / UltraStudio) へ、拡大中の絵を出す")
+        self.sdi_combo.addItem("オフ", None)
+        self.sdi_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.sdi_combo.refresh = self.refresh_sdi_modes
+        self.sdi_combo.currentIndexChanged.connect(self.sdi_changed)
+        top.addWidget(self.sdi_combo)
         top.addWidget(self._button("操作方法", self.show_help))
 
         row1 = QHBoxLayout()
@@ -338,6 +368,84 @@ class MainWindow(QMainWindow):
         self.view.show_minimap = on
         self.view.update()
 
+    # ---------- SDI 出力 ----------
+    def refresh_sdi_modes(self):
+        """メニューの中身を、今つながっている機器と出力形式で作り直す (選んでいる形式は残す)。"""
+        combo = self.sdi_combo
+        current = combo.currentData()
+        if not isinstance(self.view, GpuWindow) or self.view.sdi_program is None:
+            modes, note = [], "SDI 出力は GPU 描画のときだけ使えます"
+        else:
+            modes, note = player_sdi.list_modes()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("オフ", None)
+        keep = 0
+        many = len({m.device for m in modes}) > 1
+        for m in modes:
+            text = f"{m.device_name}: {m.label()}" if many else m.label()
+            combo.addItem(text, m)
+            if current is not None and (m.device, m.mode) == (current.device, current.mode):
+                keep = combo.count() - 1
+        if note:
+            combo.addItem(note, None)
+            combo.model().item(combo.count() - 1).setEnabled(False)
+        if current is not None and keep == 0:     # 選んでいた機器が外れた
+            combo.insertItem(1, f"{current.device_name}: {current.label()}", current)
+            keep = 1
+        combo.setCurrentIndex(keep)
+        combo.blockSignals(False)
+
+    def sdi_changed(self):
+        mode = self.sdi_combo.currentData()
+        if self.sdi is not None and mode is not None and \
+                (mode.device, mode.mode) == (self.sdi.mode.device, self.sdi.mode.mode):
+            return
+        self.stop_sdi()
+        if mode is None:
+            return self.show_sdi_off()
+        try:
+            self.sdi = player_sdi.SdiOutput(mode).open()
+        except Exception as e:
+            self.show_sdi_off()
+            QMessageBox.warning(self, "SDI 出力", f"{mode.label()} を出せません。\n{e}")
+            return
+        self.sdi_sent_mark = 0
+        self.view.set_sdi(self.sdi)
+        self.update_sdi_sequence()
+
+    def show_sdi_off(self):
+        """メニューを「オフ」に戻す (出力を選び直したことにはしない)。"""
+        self.sdi_combo.blockSignals(True)
+        self.sdi_combo.setCurrentIndex(0)
+        self.sdi_combo.blockSignals(False)
+
+    def update_sdi_sequence(self):
+        """再生中で、動画の進む速さと出力の fps が整数倍なら、画面に出たコマを順番に並べて出す
+        (出力の時計と画面の時計のずれで、コマが重なったり飛んだりしないように)。"""
+        if self.sdi is None:
+            return
+        rate = self.fps() * self.speed() if self.src else 0.0
+        self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, rate) if self.playing else None
+
+    def stop_sdi(self):
+        if self.sdi is None:
+            return
+        if isinstance(self.view, GpuWindow):
+            self.view.set_sdi(None)
+        self.sdi.close()
+        self.sdi = None
+
+    def sdi_label(self):
+        """統計の表示に足す SDI 出力の様子。"""
+        out = self.sdi
+        if out is None:
+            return ""
+        sent, self.sdi_sent_mark = out.sent - self.sdi_sent_mark, out.sent
+        if out.error:
+            return f"\nSDI {out.mode.name}: {out.error}"
+        return f"\nSDI {out.mode.label()} ・ 送ったコマ {sent / max(self.stats_dt, 1e-3):.1f} / 秒"
+
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
@@ -387,6 +495,8 @@ class MainWindow(QMainWindow):
         self.pix_fmt = gpu_format(src.pix_fmt) if self.view.pixel_format == "yuv" else "bgra"
         self.frame_w, self.frame_h = even_size(self.pix_fmt, src.width, src.height)
         self.decoder = Decoder(path, self.pix_fmt, self.frame_w, self.frame_h)
+        if isinstance(self.view, GpuWindow):
+            self.decoder.before_free = self.view.wait_copy
         self.backfill = BackFiller(path, self.pix_fmt, self.frame_w, self.frame_h)
         if isinstance(self.view, GpuWindow):
             self.view.set_color(src.bt709, src.full_range)
@@ -634,12 +744,14 @@ class MainWindow(QMainWindow):
         self.update_display_period()
         self.decoded_mark = self.decoder.decoded.value
         self.timer.start()
+        self.update_sdi_sequence()
 
     def pause(self):
         if not self.playing:
             return
         self.playing = False
         self.timer.stop()
+        self.update_sdi_sequence()
         if self.pending and self.pending[0] >= 0:
             self.decoder.release(self.pending[0])
         self.pending = None
@@ -748,6 +860,7 @@ class MainWindow(QMainWindow):
         if self.playing and self.decoder.clock.started:
             self.decoder.clock.start(self.decoder.clock.now(), self.speed())
         self.update_lock()
+        self.update_sdi_sequence()
 
     def play_fps_changed(self):
         """再生 fps を変えた。コマ番号は変わらず、再生の速さだけが変わる。"""
@@ -843,7 +956,7 @@ class MainWindow(QMainWindow):
 
     def update_stats(self):
         now = time.perf_counter()
-        dt = now - self.stats_t0
+        dt = self.stats_dt = now - self.stats_t0
         self.stats_t0 = now
         shown, self.view.painted = self.view.painted, 0
         if not self.src:
@@ -853,7 +966,7 @@ class MainWindow(QMainWindow):
         self.update_lock()                    # ウィンドウを別の画面へ動かしたときのため
         if not self.playing:
             self.view.stats_text = (f"一時停止中\n動画 {fmt_fps(self.fps())} fps{self.forced_label()}"
-                                    f" ・ 画面 {round(hz)} Hz ・ {self.view.renderer}")
+                                    f" ・ 画面 {round(hz)} Hz ・ {self.view.renderer}{self.sdi_label()}")
             self.view.stats_warn = False
         else:
             total = self.decoder.decoded.value
@@ -876,7 +989,7 @@ class MainWindow(QMainWindow):
             self.view.stats_text = (f"描画 {shown_fps:.1f} / {want:.1f} fps{self.forced_label()}"
                                     f" ・ 先読み {ahead:.2f} 秒\n"
                                     f"{reason} ・ デコード {decoded_fps:.0f} fps ・ 画面 {round(hz)} Hz"
-                                    f" ・ {self.view.renderer}{self.sync_label()}")
+                                    f" ・ {self.view.renderer}{self.sync_label()}{self.sdi_label()}")
             self.view.stats_warn = reason != "全コマ表示中"
         self.view.update()
 
@@ -961,6 +1074,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         self.arm_timer.stop()
         self.pause()
+        self.stop_sdi()
         self.close_backfill()
         if self.src:
             self.src.close()

@@ -31,9 +31,16 @@ def keep(entry):
     return not any(d in name for d in DROP)
 
 
+import os
+
+# SDI 出力用のライブラリ (build_sdi_mac.sh で作ったもの) があれば一緒に入れる
+SDI_LIB = os.path.join("sdi", "libzvp_decklink.dylib")
+SDI_BINARIES = [(SDI_LIB, "sdi")] if MAC and os.path.exists(SDI_LIB) else []
+
 a = Analysis(
     ["zoom_player.py"],
     pathex=["."],
+    binaries=SDI_BINARIES,
     excludes=["tkinter", "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick"],
     # GPU 描画 (PyOpenGL) は関数内で読み込むので明示する
     hiddenimports=["OpenGL.GL", "OpenGL.GL.shaders", "OpenGL.arrays.numpymodule",

@@ -1,10 +1,13 @@
 """動画の表示部分: 拡大縮小・パン・範囲選択・ミニマップ、CPU 描画と GPU (OpenGL) 描画。"""
+import ctypes
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 
 import numpy as np
-from player_core import PLANAR, plane_views
+from player_core import PLANAR, plane_sizes
+from player_sdi import SEQUENCE, view_transform
 from PySide6.QtCore import QCoreApplication, QEvent, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QSurfaceFormat
 from PySide6.QtOpenGL import QOpenGLWindow
@@ -12,6 +15,8 @@ from PySide6.QtWidgets import QWidget
 
 MAX_ZOOM = 64          # 全体表示に対する最大倍率
 MINI_W = 220           # ミニマップの幅
+SDI_COLLECT_MS = 10    # SDI 用の読み出しを受け取るまでの待ち (GPU が描き終えている頃)
+SDI_PBOS = 4           # SDI 用の読み出しバッファの数
 
 
 def gpu_wanted():
@@ -332,6 +337,84 @@ void main() {
 """
 
 
+# SDI 出力用: 出力の 1 行を RGBA8 のテクセルに見立てて、2vuy (8bit) か v210 (10bit) の並びを
+# そのまま書く。読み出した RGBA のバイト列が、そのまま機器へ送る 1 行になる。
+# 行は gl_FragCoord.y の小さい方 (読み出しの先頭) を画像の上にする。
+# RGB は切り詰めずに BT.709 の YUV へ戻すので、BT.709 の動画は YUV のまま (超白なども) 出る。
+# 頂点は位置だけ。古い OpenGL (macOS の 2.1) では属性 0 が有効でないと何も描かれないので、
+# 属性を pos 1 つにして必ず 0 番にする
+SDI_VERTEX_SHADER = """
+#version 120
+attribute vec2 pos;
+void main() {
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+"""
+
+SDI_SHADER = """
+#version 120
+uniform sampler2D tex_y;
+uniform sampler2D tex_u;
+uniform sampler2D tex_v;
+uniform mat3 yuv_to_rgb;
+uniform vec3 offset;
+uniform float scale;
+uniform vec2 out_size;     // 出力の幅・高さ (画素)
+uniform vec4 xform;        // 出力の画素 → 画像の uv: uv = (p - xform.xy) / xform.zw
+uniform float ten_bit;
+
+vec3 yuv_at(float x, float y) {          // 出力の画素 (x 列目, 上から y 行目) の BT.709 の Y, Cb, Cr
+    vec2 uv = (vec2(x + 0.5, y + 0.5) - xform.xy) / xform.zw;
+    if (x >= out_size.x || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)
+        return vec3(0.0);
+    vec3 src = vec3(texture2D(tex_y, uv).r, texture2D(tex_u, uv).r, texture2D(tex_v, uv).r) * scale - offset;
+    vec3 c = yuv_to_rgb * src;
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return vec3(l, (c.b - l) / 1.8556, (c.r - l) / 1.5748);
+}
+
+float code_y(float l, float unit) { return clamp(floor(16.0 * unit + 219.0 * unit * l + 0.5), unit == 4.0 ? 4.0 : 1.0, unit == 4.0 ? 1019.0 : 254.0); }
+float code_c(float c, float unit) { return clamp(floor(128.0 * unit + 224.0 * unit * c + 0.5), unit == 4.0 ? 4.0 : 1.0, unit == 4.0 ? 1019.0 : 254.0); }
+
+vec4 word(float c0, float c1, float c2) {   // 10bit を 3 つ詰めた 32bit (下位から) を 4 バイトに
+    float b0 = mod(c0, 256.0);
+    float b1 = floor(c0 / 256.0) + mod(c1, 64.0) * 4.0;
+    float b2 = floor(c1 / 64.0) + mod(c2, 16.0) * 16.0;
+    float b3 = floor(c2 / 16.0);
+    return vec4(b0, b1, b2, b3) / 255.0;
+}
+
+void main() {
+    float i = floor(gl_FragCoord.x);
+    float y = floor(gl_FragCoord.y);
+    if (ten_bit < 0.5) {                 // 2vuy: Cb Y0 Cr Y1 (2 画素)
+        vec3 p0 = yuv_at(2.0 * i, y), p1 = yuv_at(2.0 * i + 1.0, y);
+        vec2 c = (p0.yz + p1.yz) * 0.5;
+        gl_FragColor = vec4(code_c(c.x, 1.0), code_y(p0.x, 1.0), code_c(c.y, 1.0), code_y(p1.x, 1.0)) / 255.0;
+        return;
+    }
+    // v210: 6 画素を 4 語 (16 バイト) に詰める。語ごとに使う画素だけ計算するよう分岐すると、
+    // 隣の画素と別の道を通るので GPU は全部の道をたどり、かえって 3 割遅くなる。6 画素全部を計算する
+    float g = floor(i / 4.0);
+    float w = i - g * 4.0;
+    float x0 = g * 6.0;
+    vec3 p[6];
+    for (int k = 0; k < 6; k++)
+        p[k] = yuv_at(x0 + float(k), y);
+    float Y0 = code_y(p[0].x, 4.0), Y1 = code_y(p[1].x, 4.0), Y2 = code_y(p[2].x, 4.0);
+    float Y3 = code_y(p[3].x, 4.0), Y4 = code_y(p[4].x, 4.0), Y5 = code_y(p[5].x, 4.0);
+    vec2 c0 = (p[0].yz + p[1].yz) * 0.5, c1 = (p[2].yz + p[3].yz) * 0.5, c2 = (p[4].yz + p[5].yz) * 0.5;
+    float Cb0 = code_c(c0.x, 4.0), Cr0 = code_c(c0.y, 4.0);
+    float Cb1 = code_c(c1.x, 4.0), Cr1 = code_c(c1.y, 4.0);
+    float Cb2 = code_c(c2.x, 4.0), Cr2 = code_c(c2.y, 4.0);
+    if (w < 0.5)      gl_FragColor = word(Cb0, Y0, Cr0);
+    else if (w < 1.5) gl_FragColor = word(Y1, Cb1, Y2);
+    else if (w < 2.5) gl_FragColor = word(Cr1, Y3, Cb2);
+    else              gl_FragColor = word(Y4, Cr2, Y5);
+}
+"""
+
+
 def yuv_matrix(bt709, full_range, bits=8):
     """YUV → RGB の係数 (列ごと = Y, U, V の寄与、OpenGL の列優先) とオフセット。
 
@@ -402,6 +485,20 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         self.next_picture = None    # 次に表示するコマを返す関数 (再生中だけ。先に送っておく)
         self.preload_hits = 0       # 先に送ってあったコマをそのまま描けた回数 (確認用)
         self.preload_misses = 0
+        # 次のコマを転送用バッファへ写すのは裏のスレッドで行う (4K 10bit で 2〜4 ms、GUI を止めない)。
+        # 写している間は (Future, コマ, 送り先の組の番号)
+        self._copier = ThreadPoolExecutor(max_workers=1, thread_name_prefix="texture-copy")
+        self._copying = None
+        self.sdi = None             # SDI 出力 (player_sdi.SdiOutput)。あれば拡大中の絵を描いて送る
+        self._sdi_key = None        # 最後に送った絵 (コマと拡大の状態)。変わらなければ送り直さない
+        self._sdi_target = None     # (フレームバッファ, テクスチャ, 幅, 高さ, [読み出し用バッファ SDI_PBOS 個])
+        self._sdi_pending = None    # 読み出しを頼んで、まだ受け取っていない (バッファ, 出力, 大きさ, 印, 回数)
+        self._sdi_mapped = set()    # 開いて送るスレッドへ渡している読み出し用バッファ
+        self._sdi_unmap = []        # 送り終えて閉じてよいバッファ (送るスレッドが足す)
+        self._sdi_retry = False     # 描けなかった変化を後で描き直す予定があるか
+        self._sdi_seq_serial = None   # 順番に並べるとき: 最後に数えた新しいコマ (serial) と、数えた枚数
+        self._sdi_seq_count = 0
+        self.sdi_program = None
 
     _overlay = None
     _overlay_key = None
@@ -425,11 +522,24 @@ class GpuWindow(ViewBase, QOpenGLWindow):
                         for key in ("tex_y", "tex_u", "tex_v", "yuv_to_rgb", "offset", "scale")}
             self.attr_pos = GL.glGetAttribLocation(self.program, "pos")
             self.attr_uv = GL.glGetAttribLocation(self.program, "uv")
+            try:
+                self.sdi_program = shaders.compileProgram(
+                    shaders.compileShader(SDI_VERTEX_SHADER, GL.GL_VERTEX_SHADER),
+                    shaders.compileShader(SDI_SHADER, GL.GL_FRAGMENT_SHADER))
+                self.sdi_loc = {key: GL.glGetUniformLocation(self.sdi_program, key)
+                                for key in ("tex_y", "tex_u", "tex_v", "yuv_to_rgb", "offset", "scale",
+                                            "out_size", "xform", "ten_bit")}
+                self.sdi_attr_pos = GL.glGetAttribLocation(self.sdi_program, "pos")
+            except Exception as e:      # SDI 出力が使えないだけで、画面の表示は続ける
+                print(f"SDI 出力用のシェーダーを作れません: {e}")
+                self.sdi_program = None
             if self.format().swapInterval() != 1:
                 # グラフィックドライバの設定で垂直同期が切られていると、ここで分かる
                 self.renderer = "GPU描画 (垂直同期なし)"
                 print(f"垂直同期が効いていません (swap interval {self.format().swapInterval()})。"
                       "グラフィックドライバの設定を確認してください")
+            # テクスチャ転送用 (_upload)。[0] はその場で送るとき、[1] は裏のスレッドで写すとき (_preload)
+            self.upload_pbos = [int(b) for b in GL.glGenBuffers(2)]
             textures = list(GL.glGenTextures(6))
             self.sets = [TextureSet(textures[:3]), TextureSet(textures[3:])]
             self.front = 0
@@ -446,30 +556,75 @@ class GpuWindow(ViewBase, QOpenGLWindow):
             QTimer.singleShot(0, lambda: self.on_failure(reason))
 
     def _upload(self, pic, tset):
-        """3 つのプレーンを tset のそれぞれの大きさのテクスチャへ送る。10/12bit は 16bit のテクスチャ。"""
+        """3 つのプレーンを tset のそれぞれの大きさのテクスチャへ、その場で送る。"""
+        ptr = self._map_upload(0, pic.data.nbytes)
+        ctypes.memmove(ptr, pic.data.ctypes.data, pic.data.nbytes)
+        self._textures_from_buffer(0, pic, tset)
+
+    # テクスチャへは、いったん GPU の転送用バッファ (PBO) へまとめて写し、そこから GPU が写す。
+    # 手元のメモリから直接 glTexSubImage2D すると、macOS ではドライバが CPU で写し直すので
+    # 4K 8bit で 7 ms、10bit で 14 ms かかり、4K 10bit 4:2:2 は 60 コマ出せなかった (PBO なら 0.5〜2 ms)。
+    def _map_upload(self, i, nbytes):
+        """転送用バッファ i を nbytes の大きさで開き、書き込む先のアドレスを返す。"""
+        GL = self.GL
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self.upload_pbos[i])
+        # 中身を捨てて作り直すと、GPU が前のコマをまだ読んでいても待たずに書ける
+        GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, nbytes, None, GL.GL_STREAM_DRAW)
+        ptr = GL.glMapBuffer(GL.GL_PIXEL_UNPACK_BUFFER, GL.GL_WRITE_ONLY)
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+        if not ptr:
+            raise RuntimeError("テクスチャ転送用のバッファを開けません")
+        return int(ptr)
+
+    def _textures_from_buffer(self, i, pic, tset):
+        """書き終えた転送用バッファ i を閉じ、そこから tset の 3 つのテクスチャへ送る。10/12bit は 16bit。"""
         GL = self.GL
         bps = PLANAR[pic.fmt][2]
-        internal, kind = (GL.GL_LUMINANCE, GL.GL_UNSIGNED_BYTE) if bps == 1 else             (GL.GL_LUMINANCE16, GL.GL_UNSIGNED_SHORT)
+        internal, kind = (GL.GL_LUMINANCE, GL.GL_UNSIGNED_BYTE) if bps == 1 else \
+            (GL.GL_LUMINANCE16, GL.GL_UNSIGNED_SHORT)
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self.upload_pbos[i])
+        GL.glUnmapBuffer(GL.GL_PIXEL_UNPACK_BUFFER)
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
         layout = (pic.fmt, pic.w, pic.h)
         realloc = tset.layout != layout
-        for tex, plane in zip(tset.textures, plane_views(pic.data, pic.fmt, pic.w, pic.h)):
-            ph, pw = plane.shape
+        offset = 0
+        for tex, (pw, ph) in zip(tset.textures, plane_sizes(pic.fmt, pic.w, pic.h)):
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            src = ctypes.c_void_p(offset)          # 転送用バッファの中の位置
             if realloc:
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal, pw, ph, 0, GL.GL_LUMINANCE, kind, plane)
+                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal, pw, ph, 0, GL.GL_LUMINANCE, kind, src)
             else:
-                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, pw, ph, GL.GL_LUMINANCE, kind, plane)
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, pw, ph, GL.GL_LUMINANCE, kind, src)
+            offset += pw * ph * bps
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         # 既定値に戻す。1 のままだと Qt が文字をテクスチャに書くときに崩れる
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
         tset.layout = layout
         tset.key = picture_key(pic)
 
+    def wait_copy(self):
+        """裏のスレッドがコマのメモリから写している途中なら、写し終わるまで待つ。
+
+        画面側はコマのスロットを空きに戻す (デコード側が上書きする) 前にこれを呼ぶ (Decoder.before_free)。
+        """
+        if self._copying is not None:
+            self._copying[0].result()
+
+    def _finish_copy(self):
+        """裏のスレッドで写したコマを、テクスチャの組へ送る (写し終わっていなければ待つ)。"""
+        if self._copying is None:
+            return
+        future, pic, index = self._copying
+        self._copying = None
+        future.result()
+        self._textures_from_buffer(1, pic, self.sets[index])
+
     def _textures_for(self, pic):
         """pic が入っているテクスチャの組を返す。先に送ってなければ、今の表でない組へ送る。"""
+        self._finish_copy()
         key = picture_key(pic)
         if self.sets[self.front].key == key:        # 同じコマの描き直し (拡大や文字の更新)
             return self.front
@@ -482,13 +637,21 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         return back
 
     def _preload(self):
-        """次に表示するコマを裏の組へ先に送っておく (次の書き換えでは描くだけで済む)。"""
+        """次に表示するコマを裏の組へ先に送っておく (次の書き換えでは描くだけで済む)。
+
+        転送用バッファへ写すのは裏のスレッドで始め、テクスチャへ送るのは次に描くとき (_finish_copy)。
+        """
         nxt = self.next_picture() if self.next_picture else None
-        if nxt is None or nxt.fmt not in PLANAR:
+        if nxt is None or nxt.fmt not in PLANAR or self._copying is not None:
             return
-        back = self.sets[1 - self.front]
-        if back.key != picture_key(nxt) and self.sets[self.front].key != picture_key(nxt):
-            self._upload(nxt, back)
+        index = 1 - self.front
+        if self.sets[index].key == picture_key(nxt) or self.sets[self.front].key == picture_key(nxt):
+            return
+        self.sets[index].key = None                  # 写し終わるまで、この組の中身は使えない
+        ptr = self._map_upload(1, nxt.data.nbytes)
+        # ctypes.memmove は写している間 GIL を手放すので、GUI のスレッドと並んで動く
+        future = self._copier.submit(ctypes.memmove, ptr, nxt.data.ctypes.data, nxt.data.nbytes)
+        self._copying = (future, nxt, index)
 
     def _quad(self, rect):
         """画面上の rect (論理ピクセル) に画像全体を描く。"""
@@ -539,6 +702,8 @@ class GpuWindow(ViewBase, QOpenGLWindow):
             self._quad(mini)
         GL.glDisableVertexAttribArray(self.attr_pos)
         GL.glDisableVertexAttribArray(self.attr_uv)
+        if self.sdi is not None:
+            self._send_sdi(matrix, offset, bits)
         GL.glUseProgram(0)
         for unit in range(3):
             GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
@@ -550,6 +715,168 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         p.endNativePainting()
         self.count_painted()
         p.drawImage(0, 0, self.overlay_image(mini))
+
+    # ---------- SDI 出力 ----------
+    def sdi_state(self):
+        """SDI へ送る絵を決めるもの。変わったときだけ描き直して送る。"""
+        return (self.serial, round(self.s, 9), round(self.tx, 3), round(self.ty, 3), self.width(), self.height(),
+                self.pixelated, self.bt709, self.full_range, id(self.sdi))
+
+    def _send_sdi(self, matrix, offset, bits):
+        """拡大中の絵を SDI の解像度で描き、2vuy / v210 に詰めて読み出し、SDI 出力へ渡す。
+
+        画面と同じテクスチャ (いま表の組) を使うので、画面に出したコマと同じコマが出る。
+        いつ描くかは player_sdi の説明のとおり (順番に並べるときは新しいコマごと、それ以外は機器のコマごと)。
+        読み出しは GPU のバッファへ頼むだけで、受け取るのは次の書き換えか少し後 (_collect_sdi)。
+        """
+        if self.sdi_program is None:
+            return
+        self._collect_sdi()
+        self._unmap_sdi()
+        out = self.sdi
+        key = self.sdi_state()
+        if key == self._sdi_key:
+            return
+        sequence = out.sequence
+        if sequence:
+            # 新しいコマが出るたびに数え、m 枚に 1 枚を描く。拡大の変化だけでは描かない (次のコマに乗る)
+            if self.serial == self._sdi_seq_serial:
+                return
+            self._sdi_seq_serial = self.serial
+            self._sdi_seq_count += 1
+            if self._sdi_seq_count % sequence[1]:
+                return
+        elif not out.due():
+            if not self._sdi_retry:          # 止まっているときも最後の変化を出すため、後で描き直す
+                self._sdi_retry = True
+                QTimer.singleShot(max(1, math.ceil(out.wait_time() * 1000)), self._sdi_again)
+            return
+        fb, _, TW, H, pbos = self._sdi_target_for(out.texels, out.height)
+        busy = self._sdi_mapped | ({self._sdi_pending[0]} if self._sdi_pending else set())
+        pbo = next((b for b in pbos if b not in busy), None)
+        if pbo is None:                  # 送るのが追いつかず、読み出し用バッファが空いていない
+            return
+        GL = self.GL
+        so, ox, oy = view_transform(self.width(), self.height(), self.s, self.tx, self.ty,
+                                    self.picture.w, self.picture.h, out.width, H)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fb)
+        GL.glViewport(0, 0, TW, H)
+        GL.glUseProgram(self.sdi_program)
+        loc = self.sdi_loc
+        GL.glUniformMatrix3fv(loc["yuv_to_rgb"], 1, GL.GL_FALSE, matrix)
+        GL.glUniform3f(loc["offset"], *offset)
+        GL.glUniform1f(loc["scale"], 1.0 if bits == 8 else 65535 / ((1 << bits) - 1))
+        for unit, name in enumerate(("tex_y", "tex_u", "tex_v")):
+            GL.glUniform1i(loc[name], unit)
+        GL.glUniform2f(loc["out_size"], out.width, H)
+        GL.glUniform4f(loc["xform"], ox, oy, self.picture.w * so, self.picture.h * so)
+        GL.glUniform1f(loc["ten_bit"], 1.0 if out.ten_bit else 0.0)
+        pos = np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32)
+        GL.glEnableVertexAttribArray(self.sdi_attr_pos)
+        GL.glVertexAttribPointer(self.sdi_attr_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, pos)
+        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        GL.glDisableVertexAttribArray(self.sdi_attr_pos)
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 4)
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
+        GL.glReadPixels(0, 0, TW, H, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+        # 画面へ描く状態に戻す
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        dpr = self.devicePixelRatioF()
+        GL.glViewport(0, 0, round(self.width() * dpr), round(self.height() * dpr))
+        out.rendered()
+        self._sdi_key = key
+        tag, repeat = (SEQUENCE, sequence[0]) if sequence else (out.rendered_frame, 1)
+        self._sdi_pending = (pbo, out, TW * 4 * H, tag, repeat)
+        QTimer.singleShot(SDI_COLLECT_MS, self._collect_sdi_later)
+
+    def _sdi_target_for(self, width, height):
+        """SDI 用に描く先 (width × height の RGBA8 テクスチャを付けたフレームバッファ) と読み出し用バッファ。
+        大きさが変わったら作り直す。"""
+        target = self._sdi_target
+        if target is not None and target[2:4] == (width, height):
+            return target
+        GL = self.GL
+        if target is not None:
+            GL.glDeleteFramebuffers(1, [target[0]])
+            GL.glDeleteTextures([target[1]])
+            GL.glDeleteBuffers(len(target[4]), target[4])
+        tex = GL.glGenTextures(1)
+        # ユニット 0〜2 には Y / U / V が付いているので、空いているユニットで作る
+        GL.glActiveTexture(GL.GL_TEXTURE3)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, width, height, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        fb = GL.glGenFramebuffers(1)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fb)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, tex, 0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        # 読み出し中のもの・送るスレッドが使っているものがあるので、いくつかを順に使う
+        pbos = [int(b) for b in GL.glGenBuffers(SDI_PBOS)]
+        for b in pbos:
+            GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, b)
+            GL.glBufferData(GL.GL_PIXEL_PACK_BUFFER, width * 4 * height, None, GL.GL_STREAM_READ)
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+        self._sdi_target = (fb, tex, width, height, pbos)
+        return self._sdi_target
+
+    def _collect_sdi(self):
+        """頼んでおいた読み出しを受け取り、SDI 出力へ渡す。OpenGL の文脈が今のときに呼ぶ。"""
+        if self._sdi_pending is None:
+            return
+        pbo, out, size, tag, repeat = self._sdi_pending
+        self._sdi_pending = None
+        if out is not self.sdi:
+            return
+        GL = self.GL
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
+        ptr = GL.glMapBuffer(GL.GL_PIXEL_PACK_BUFFER, GL.GL_READ_ONLY)
+        if ptr and out.accepts_pointer:
+            # 開いたまま送るスレッドへ渡し、そこから機器のコマへ直接写す。閉じるのは送り終えてから
+            self._sdi_mapped.add(pbo)
+            out.submit_pointer(int(ptr), tag, lambda: self._sdi_unmap.append(pbo), repeat)
+        elif ptr:                       # 写しを渡す (確認用の出力など)
+            data = np.ctypeslib.as_array((ctypes.c_uint8 * size).from_address(int(ptr))).copy()
+            GL.glUnmapBuffer(GL.GL_PIXEL_PACK_BUFFER)
+            out.submit(data, tag, repeat)
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+
+    def _unmap_sdi(self):
+        """送り終えた読み出し用バッファを閉じる。OpenGL の文脈が今のときに呼ぶ。"""
+        if not self._sdi_unmap:
+            return
+        GL = self.GL
+        while self._sdi_unmap:
+            pbo = self._sdi_unmap.pop()
+            GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
+            GL.glUnmapBuffer(GL.GL_PIXEL_PACK_BUFFER)
+            self._sdi_mapped.discard(pbo)
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+
+    def _collect_sdi_later(self):
+        """書き換えが来ないとき (停止中) にも、読み出しを受け取り、送り終えたバッファを閉じる。"""
+        if (self._sdi_pending is not None or self._sdi_unmap) and self.initialized:
+            self.makeCurrent()
+            self._collect_sdi()
+            self._unmap_sdi()
+            self.doneCurrent()
+
+    def _sdi_again(self):
+        self._sdi_retry = False
+        if self.sdi is not None and self.sdi_state() != self._sdi_key:
+            self.update()
+
+    def set_sdi(self, output):
+        """SDI 出力を付け替える (None で止める)。古い出力は呼んだ側が閉じる。"""
+        self.sdi = output
+        self._sdi_key = None
+        self._sdi_pending = None
+        self.update()
+        # 止めた出力が送り終えたバッファを閉じる (呼んだ側が古い出力を閉じた後)
+        QTimer.singleShot(50, self._collect_sdi_later)
 
     def overlay_image(self, mini):
         """文字や枠 (draw_overlays) を描いた透明な画像。中身が変わったときだけ描き直す。
