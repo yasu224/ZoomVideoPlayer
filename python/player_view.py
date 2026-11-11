@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QWidget
 
 MAX_ZOOM = 64          # 全体表示に対する最大倍率
 MINI_W = 220           # ミニマップの幅
-SDI_COLLECT_MS = 10    # SDI 用の読み出しを受け取るまでの待ち (GPU が描き終えている頃)
+SDI_COLLECT_MS = 10    # 停止中など書き換えが来ないときに、SDI 用に描いた絵の読み出しを頼むまでの待ち
 SDI_PBOS = 4           # SDI 用の読み出しバッファの数
 SDI_CODES_UNIT = 4     # v210 の 2 回目で、1 回目の結果を付けるテクスチャユニット (0〜2 は Y/U/V、3 は作るとき用)
 
@@ -342,6 +342,8 @@ void main() {
 # そのまま書く。読み出した RGBA のバイト列が、そのまま機器へ送る 1 行になる。
 # 行は gl_FragCoord.y の小さい方 (読み出しの先頭) を画像の上にする。
 # RGB は切り詰めずに BT.709 の YUV へ戻すので、BT.709 の動画は YUV のまま (超白なども) 出る。
+# 2vuy は 1 回で描く (stage 0)。v210 は 2 回に分ける: 2 画素ごとに色を変換して 10bit のコード値を
+# 16bit のテクスチャへ書き (stage 1)、それを読んで 6 画素 = 4 語に詰める (stage 2)。
 # 頂点は位置だけ。古い OpenGL (macOS の 2.1) では属性 0 が有効でないと何も描かれないので、
 # 属性を pos 1 つにして必ず 0 番にする
 SDI_VERTEX_SHADER = """
@@ -459,6 +461,18 @@ def picture_key(pic):
     return (id(pic.data), pic.t)
 
 
+class SdiRead:
+    """SDI 用に描いた 1 枚の、GPU からの読み出し。描く → 読み出しを頼む (fence を立てる) → 受け取る。"""
+
+    __slots__ = ("pbo", "out", "size", "tag", "repeat", "fb", "width", "height", "fence")
+
+    def __init__(self, pbo, out, tag, repeat, fb, width, height):
+        self.pbo, self.out, self.tag, self.repeat = pbo, out, tag, repeat
+        self.fb, self.width, self.height = fb, width, height
+        self.size = width * 4 * height            # RGBA8 で読む
+        self.fence = None
+
+
 class GpuWindow(ViewBase, QOpenGLWindow):
     """OpenGL で表示する。YUV の 3 プレーンをテクスチャにして、色変換と拡大縮小を GPU で行う。
 
@@ -499,12 +513,12 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         self.sdi = None             # SDI 出力 (player_sdi.SdiOutput)。あれば拡大中の絵を描いて送る
         self._sdi_key = None        # 最後に送った絵 (コマと拡大の状態)。変わらなければ送り直さない
         self._sdi_target = None     # (フレームバッファ, テクスチャ, 幅, 高さ, [読み出し用バッファ SDI_PBOS 個])
-        # 読み出しを頼んで、まだ受け取っていないもの。古い順に [バッファ, 出力, 大きさ, 印, 回数, 終わりの印]。
-        # 終わりの印 (GL の fence) が立つまでは開かない (開くと GPU が読み出しを終えるまで画面側が止まるため)
+        # 読み出しを頼んで、まだ受け取っていないもの (SdiRead、古い順)。終わりの印 (GL の fence) が
+        # 立つまでは開かない (開くと GPU が読み出しを終えるまで画面側が止まるため)
         self._sdi_pending = []
         self._sdi_poll = False      # 読み出しの終わりを確かめ直す予定があるか
         self._sdi_codes = None      # v210 の 1 回目の書く先 (フレームバッファ, テクスチャ, 幅, 高さ)
-        self._sdi_drawn = None      # 描いて、まだ読み出しを頼んでいない絵 (次の書き換えで頼む)
+        self._sdi_drawn = None      # 描いて、まだ読み出しを頼んでいない絵 (SdiRead。次の書き換えで頼む)
         self._sdi_mapped = set()    # 開いて送るスレッドへ渡している読み出し用バッファ
         self._sdi_unmap = []        # 送り終えて閉じてよいバッファ (送るスレッドが足す)
         self._sdi_retry = False     # 描けなかった変化を後で描き直す予定があるか
@@ -767,9 +781,9 @@ class GpuWindow(ViewBase, QOpenGLWindow):
                 QTimer.singleShot(max(1, math.ceil(out.wait_time() * 1000)), self._sdi_again)
             return
         fb, _, TW, H, pbos = self._sdi_target_for(out.texels, out.height)
-        busy = self._sdi_mapped | {item[0] for item in self._sdi_pending}
+        busy = self._sdi_mapped | {r.pbo for r in self._sdi_pending}
         if self._sdi_drawn is not None:
-            busy.add(self._sdi_drawn[0])
+            busy.add(self._sdi_drawn.pbo)
         pbo = next((b for b in pbos if b not in busy), None)
         if pbo is None:                  # 送るのが追いつかず、読み出し用バッファが空いていない
             return
@@ -819,26 +833,24 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         out.rendered()
         self._sdi_key = key
         tag, repeat = (SEQUENCE, sequence[0]) if sequence else (out.rendered_frame, 1)
-        self._sdi_drawn = [pbo, out, TW * 4 * H, tag, repeat, fb, TW, H]
+        self._sdi_drawn = SdiRead(pbo, out, tag, repeat, fb, TW, H)
         # 書き換えが来ないとき (停止中) は、少し後に読み出しを頼む
         self._poll_sdi_later(SDI_COLLECT_MS)
 
     def _read_sdi(self):
         """前に描いた SDI の絵の読み出しを頼む (GPU のバッファへ。待たない)。OpenGL の文脈が今のときに呼ぶ。"""
-        drawn, self._sdi_drawn = self._sdi_drawn, None
-        if drawn is None:
-            return
-        pbo, out, size, tag, repeat, fb, TW, H = drawn
-        if out is not self.sdi:
+        read, self._sdi_drawn = self._sdi_drawn, None
+        if read is None or read.out is not self.sdi:
             return
         GL = self.GL
-        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, fb)
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, read.fb)
         GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 4)
-        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
-        GL.glReadPixels(0, 0, TW, H, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, read.pbo)
+        GL.glReadPixels(0, 0, read.width, read.height, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
         GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
         GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.defaultFramebufferObject())
-        self._sdi_pending.append([pbo, out, size, tag, repeat, self._fence()])
+        read.fence = self._fence()
+        self._sdi_pending.append(read)
         self._poll_sdi_later(2)
 
     def _sdi_target_for(self, width, height):
@@ -911,42 +923,45 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glFlush()                     # 命令を GPU へ送り出す (送らないと印がいつまでも立たない)
         return fence
 
-    def _fence_done(self, fence, wait=False):
+    def _fence_done(self, fence):
+        """印が立ったか (待たずに確かめる)。印が無い (fence を使えない環境) ときは立ったとみなす。"""
         if fence is None:
             return True
         GL = self.GL
-        status = GL.glClientWaitSync(fence, 0, 0 if not wait else 1_000_000_000)
-        return status in (GL.GL_ALREADY_SIGNALED, GL.GL_CONDITION_SATISFIED)
+        return GL.glClientWaitSync(fence, 0, 0) in (GL.GL_ALREADY_SIGNALED, GL.GL_CONDITION_SATISFIED)
 
-    def _collect_sdi(self, wait=False):
+    def _collect_sdi(self):
         """読み出しが終わったものを古い順に受け取り、SDI 出力へ渡す。OpenGL の文脈が今のときに呼ぶ。
 
         まだ終わっていないものは開かずに残す (開くと終わるまで画面側が止まり、4K では 80 ms も止まって
-        画面のコマが遅れ、SDI へ送るコマも減っていた)。wait なら終わるまで待つ。
+        画面のコマが遅れ、SDI へ送るコマも減っていた)。止めた出力のものは捨てる。
         """
         GL = self.GL
         while self._sdi_pending:
-            pbo, out, size, tag, repeat, fence = self._sdi_pending[0]
-            if out is self.sdi and not self._fence_done(fence, wait):
+            read = self._sdi_pending[0]
+            current = read.out is self.sdi
+            if current and not self._fence_done(read.fence):
                 break                    # 順番を守るため、これより新しいものも待つ
             self._sdi_pending.pop(0)
-            if fence is not None:
-                GL.glDeleteSync(fence)
-            if out is self.sdi:
-                self._submit_sdi(pbo, out, size, tag, repeat)
+            if read.fence is not None:
+                GL.glDeleteSync(read.fence)
+            if current:
+                self._submit_sdi(read)
 
-    def _submit_sdi(self, pbo, out, size, tag, repeat):
+    def _submit_sdi(self, read):
+        """読み出しを終えたバッファを開き、SDI 出力へ渡す。"""
         GL = self.GL
-        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, read.pbo)
         ptr = GL.glMapBuffer(GL.GL_PIXEL_PACK_BUFFER, GL.GL_READ_ONLY)
+        out, pbo = read.out, read.pbo
         if ptr and out.accepts_pointer:
             # 開いたまま送るスレッドへ渡し、そこから機器のコマへ直接写す。閉じるのは送り終えてから
             self._sdi_mapped.add(pbo)
-            out.submit_pointer(int(ptr), tag, lambda: self._sdi_unmap.append(pbo), repeat)
+            out.submit_pointer(int(ptr), read.tag, lambda: self._sdi_unmap.append(pbo), read.repeat)
         elif ptr:                       # 写しを渡す (確認用の出力など)
-            data = np.ctypeslib.as_array((ctypes.c_uint8 * size).from_address(int(ptr))).copy()
+            data = np.ctypeslib.as_array((ctypes.c_uint8 * read.size).from_address(int(ptr))).copy()
             GL.glUnmapBuffer(GL.GL_PIXEL_PACK_BUFFER)
-            out.submit(data, tag, repeat)
+            out.submit(data, read.tag, read.repeat)
         GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
 
     def _unmap_sdi(self):
