@@ -6,7 +6,7 @@ import math
 import os
 
 import numpy as np
-from player_core import PLANAR, plane_sizes
+from player_core import SEMI, YUV_FORMATS, plane_sizes, texture_scale
 from player_sdi import SEQUENCE, view_transform
 from PySide6.QtCore import QCoreApplication, QEvent, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QSurfaceFormat
@@ -330,9 +330,12 @@ uniform sampler2D tex_v;
 uniform mat3 yuv_to_rgb;
 uniform vec3 offset;
 uniform float scale;      // 16bit テクスチャに入った 10/12bit の値を 0〜1 に直す倍率 (8bit は 1)
+uniform float semi;       // 1: 色差を交互に並べた形式 (tex_u に Cb を明るさ、Cr を透明度として持つ)
 varying vec2 v_uv;
 void main() {
-    vec3 yuv = vec3(texture2D(tex_y, v_uv).r, texture2D(tex_u, v_uv).r, texture2D(tex_v, v_uv).r) * scale - offset;
+    vec3 yuv = (semi > 0.5 ? vec3(texture2D(tex_y, v_uv).r, texture2D(tex_u, v_uv).ra)
+                           : vec3(texture2D(tex_y, v_uv).r, texture2D(tex_u, v_uv).r, texture2D(tex_v, v_uv).r))
+               * scale - offset;
     gl_FragColor = vec4(clamp(yuv_to_rgb * yuv, 0.0, 1.0), 1.0);
 }
 """
@@ -364,6 +367,7 @@ uniform vec3 offset;
 uniform float scale;
 uniform vec2 out_size;     // 出力の幅・高さ (画素)
 uniform vec4 xform;        // 出力の画素 → 画像の uv: uv = (p - xform.xy) / xform.zw
+uniform float semi;        // 1: 色差を交互に並べた形式 (FRAGMENT_SHADER と同じ)
 uniform float stage;       // 0: 2vuy を詰める / 1: 2 画素ごとの 10bit のコード値 / 2: 1 の結果を v210 に詰める
 uniform sampler2D tex_codes;   // stage 2 で読む、stage 1 の結果 (Y0, Y1, Cb, Cr のコード値 / 1023)
 uniform vec2 codes_size;
@@ -372,7 +376,9 @@ vec3 yuv_at(float x, float y) {          // 出力の画素 (x 列目, 上から
     vec2 uv = (vec2(x + 0.5, y + 0.5) - xform.xy) / xform.zw;
     if (x >= out_size.x || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)
         return vec3(0.0);
-    vec3 src = vec3(texture2D(tex_y, uv).r, texture2D(tex_u, uv).r, texture2D(tex_v, uv).r) * scale - offset;
+    vec3 src = (semi > 0.5 ? vec3(texture2D(tex_y, uv).r, texture2D(tex_u, uv).ra)
+                           : vec3(texture2D(tex_y, uv).r, texture2D(tex_u, uv).r, texture2D(tex_v, uv).r))
+               * scale - offset;
     vec3 c = yuv_to_rgb * src;
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
     return vec3(l, (c.b - l) / 1.8556, (c.r - l) / 1.5748);
@@ -545,7 +551,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
                 shaders.compileShader(VERTEX_SHADER, GL.GL_VERTEX_SHADER),
                 shaders.compileShader(FRAGMENT_SHADER, GL.GL_FRAGMENT_SHADER))
             self.loc = {key: GL.glGetUniformLocation(self.program, key)
-                        for key in ("tex_y", "tex_u", "tex_v", "yuv_to_rgb", "offset", "scale")}
+                        for key in ("tex_y", "tex_u", "tex_v", "yuv_to_rgb", "offset", "scale", "semi")}
             self.attr_pos = GL.glGetAttribLocation(self.program, "pos")
             self.attr_uv = GL.glGetAttribLocation(self.program, "uv")
             try:
@@ -554,7 +560,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
                     shaders.compileShader(SDI_SHADER, GL.GL_FRAGMENT_SHADER))
                 self.sdi_loc = {key: GL.glGetUniformLocation(self.sdi_program, key)
                                 for key in ("tex_y", "tex_u", "tex_v", "yuv_to_rgb", "offset", "scale",
-                                            "out_size", "xform", "stage", "tex_codes", "codes_size")}
+                                            "out_size", "xform", "stage", "tex_codes", "codes_size", "semi")}
                 self.sdi_attr_pos = GL.glGetAttribLocation(self.sdi_program, "pos")
             except Exception as e:      # SDI 出力が使えないだけで、画面の表示は続ける
                 print(f"SDI 出力用のシェーダーを作れません: {e}")
@@ -603,27 +609,35 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         return int(ptr)
 
     def _textures_from_buffer(self, i, pic, tset):
-        """書き終えた転送用バッファ i を閉じ、そこから tset の 3 つのテクスチャへ送る。10/12bit は 16bit。"""
+        """書き終えた転送用バッファ i を閉じ、そこから tset のテクスチャへ送る。10/12bit は 16bit。
+
+        Y・U・V の形式は 3 枚。色差を交互に並べた形式は 2 枚で、2 枚目は Cb を明るさ、Cr を透明度とする
+        2 チャンネルのテクスチャにする (シェーダーの semi)。
+        """
         GL = self.GL
-        bps = PLANAR[pic.fmt][2]
-        internal, kind = (GL.GL_LUMINANCE, GL.GL_UNSIGNED_BYTE) if bps == 1 else \
-            (GL.GL_LUMINANCE16, GL.GL_UNSIGNED_SHORT)
+        bps = YUV_FORMATS[pic.fmt][2]
+        kind = GL.GL_UNSIGNED_BYTE if bps == 1 else GL.GL_UNSIGNED_SHORT
+        one = (GL.GL_LUMINANCE if bps == 1 else GL.GL_LUMINANCE16, GL.GL_LUMINANCE, 1)
+        two = (GL.GL_LUMINANCE8_ALPHA8 if bps == 1 else GL.GL_LUMINANCE16_ALPHA16, GL.GL_LUMINANCE_ALPHA, 2)
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self.upload_pbos[i])
         GL.glUnmapBuffer(GL.GL_PIXEL_UNPACK_BUFFER)
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
         layout = (pic.fmt, pic.w, pic.h)
         realloc = tset.layout != layout
         offset = 0
-        for tex, (pw, ph) in zip(tset.textures, plane_sizes(pic.fmt, pic.w, pic.h)):
+        semi = pic.fmt in SEMI
+        for n, (tex, (cols, rows)) in enumerate(zip(tset.textures, plane_sizes(pic.fmt, pic.w, pic.h))):
+            internal, fmt, channels = two if semi and n == 1 else one
+            width = cols // channels               # テクセルの数 (CbCr は 2 つで 1 テクセル)
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
             src = ctypes.c_void_p(offset)          # 転送用バッファの中の位置
             if realloc:
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal, pw, ph, 0, GL.GL_LUMINANCE, kind, src)
+                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal, width, rows, 0, fmt, kind, src)
             else:
-                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, pw, ph, GL.GL_LUMINANCE, kind, src)
-            offset += pw * ph * bps
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, rows, fmt, kind, src)
+            offset += cols * rows * bps
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         # 既定値に戻す。1 のままだと Qt が文字をテクスチャに書くときに崩れる
@@ -668,7 +682,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         転送用バッファへ写すのは裏のスレッドで始め、テクスチャへ送るのは次に描くとき (_finish_copy)。
         """
         nxt = self.next_picture() if self.next_picture else None
-        if nxt is None or nxt.fmt not in PLANAR or self._copying is not None:
+        if nxt is None or nxt.fmt not in YUV_FORMATS or self._copying is not None:
             return
         index = 1 - self.front
         if self.sets[index].key == picture_key(nxt) or self.sets[self.front].key == picture_key(nxt):
@@ -695,7 +709,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         if not self.initialized:
             return
         p = QPainter(self)
-        if not self.has_image() or self.picture.fmt not in PLANAR:
+        if not self.has_image() or self.picture.fmt not in YUV_FORMATS:
             p.fillRect(self.area(), Qt.black)
             return self.draw_placeholder(p)
         mini = self.minimap_rect()
@@ -708,12 +722,14 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glDisable(GL.GL_BLEND)
         self.front = self._textures_for(self.picture)
         GL.glUseProgram(self.program)
-        bits = PLANAR[self.picture.fmt][3]
+        fmt = self.picture.fmt
+        bits = YUV_FORMATS[fmt][3]
         matrix, offset = yuv_matrix(self.bt709, self.full_range, bits)
         GL.glUniformMatrix3fv(self.loc["yuv_to_rgb"], 1, GL.GL_FALSE, matrix)
         GL.glUniform3f(self.loc["offset"], *offset)
         # 16bit テクスチャは 65535 を 1 として読めるので、bits ビットの最大値が 1 になるよう直す
-        GL.glUniform1f(self.loc["scale"], 1.0 if bits == 8 else 65535 / ((1 << bits) - 1))
+        GL.glUniform1f(self.loc["scale"], texture_scale(fmt))
+        GL.glUniform1f(self.loc["semi"], 1.0 if fmt in SEMI else 0.0)
         filt = GL.GL_NEAREST if self.pixelated else GL.GL_LINEAR
         for unit, (tex, name) in enumerate(zip(self.sets[self.front].textures, ("tex_y", "tex_u", "tex_v"))):
             GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
@@ -729,7 +745,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glDisableVertexAttribArray(self.attr_pos)
         GL.glDisableVertexAttribArray(self.attr_uv)
         if self.sdi is not None:
-            self._send_sdi(matrix, offset, bits)
+            self._send_sdi(matrix, offset, fmt)
         GL.glUseProgram(0)
         for unit in range(3):
             GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
@@ -748,7 +764,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         return (self.serial, round(self.s, 9), round(self.tx, 3), round(self.ty, 3), self.width(), self.height(),
                 self.pixelated, self.bt709, self.full_range, id(self.sdi))
 
-    def _send_sdi(self, matrix, offset, bits):
+    def _send_sdi(self, matrix, offset, fmt):
         """拡大中の絵を SDI の解像度で描き、2vuy / v210 に詰めて読み出し、SDI 出力へ渡す。
 
         画面と同じテクスチャ (いま表の組) を使うので、画面に出したコマと同じコマが出る。
@@ -794,7 +810,8 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         loc = self.sdi_loc
         GL.glUniformMatrix3fv(loc["yuv_to_rgb"], 1, GL.GL_FALSE, matrix)
         GL.glUniform3f(loc["offset"], *offset)
-        GL.glUniform1f(loc["scale"], 1.0 if bits == 8 else 65535 / ((1 << bits) - 1))
+        GL.glUniform1f(loc["scale"], texture_scale(fmt))
+        GL.glUniform1f(loc["semi"], 1.0 if fmt in SEMI else 0.0)
         for unit, name in enumerate(("tex_y", "tex_u", "tex_v")):
             GL.glUniform1i(loc[name], unit)
         GL.glUniform1i(loc["tex_codes"], SDI_CODES_UNIT)

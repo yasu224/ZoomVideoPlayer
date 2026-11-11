@@ -15,7 +15,7 @@ import queue
 import sys
 import time
 
-from player_core import END_OF_FILE, WRAP, VideoSource, even_size, gpu_format
+from player_core import END_OF_FILE, WRAP, VideoSource, even_size, gpu_format, probe_hw
 from player_frames import BackFiller, Decoder, FrameCache, make_picture
 import player_sdi
 from player_os import KeepRunning, raise_ui_thread_priority
@@ -30,6 +30,10 @@ from PySide6.QtWidgets import (
 
 COMMON_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60, 119.88, 120, 144, 240]
 SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2, 4]
+# ハードウェアデコードは、開くときに測った速さが動画の fps のこれだけ倍あるときだけ使う。1 コマずつ順に
+# 解くので 4K 10bit では 60fps 前後が限界で、届かないと再生でコマが落ちる。開くときの短い測定は、
+# 続けて解いたときより 15% ほど速く出るので、その分の余裕を見る。足りなければソフトで解く
+HW_FPS_MARGIN = 1.15
 # 時刻表示の等幅フォント。その OS にないフォント名を先に書くと、Qt が代わりを探すのに
 # 起動時 0.1 秒ほどかかるので、OS ごとにある名前だけを書く。
 MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
@@ -142,6 +146,7 @@ class MainWindow(QMainWindow):
         self.path = None
         self.cache = FrameCache()    # 停止中に見たコマ (戻るコマ送りを速くする)
         self.scrub_value = None      # シークバーをドラッグ中の、まだ表示していない位置
+        self.hw_decode = False       # 再生中のデコードをハードウェアで行っているか (load で決める)
         self.sdi = None              # SDI 出力 (player_sdi.SdiOutput)
         self.keep_running = KeepRunning()   # SDI 出力中は、裏に回っても OS に遅らせない
         self.sdi_sent_mark = 0       # 統計の表示で、前回までに送ったコマ数
@@ -252,6 +257,13 @@ class MainWindow(QMainWindow):
         self.mini_check.setFocusPolicy(Qt.NoFocus)
         self.mini_check.toggled.connect(self.set_minimap)
         top.addWidget(self.mini_check)
+        self.hw_check = QCheckBox("HWデコード")
+        self.hw_check.setChecked(True)
+        self.hw_check.setFocusPolicy(Qt.NoFocus)
+        self.hw_check.setToolTip("再生中のデコードを GPU (ハードウェア) で行い、CPU の負荷を下げる。\n"
+                                 "動画の fps に間に合わない形式・解像度では使わない (一時停止中のコマ送りは常にソフト)")
+        self.hw_check.toggled.connect(self.hw_toggled)
+        top.addWidget(self.hw_check)
         top.addSpacing(8)
         top.addWidget(QLabel("SDI出力"))
         self.sdi_combo = SdiCombo()
@@ -345,6 +357,17 @@ class MainWindow(QMainWindow):
     def set_pixelated(self, on):
         self.view.pixelated = on
         self.view.update()
+
+    def hw_toggled(self):
+        """HW デコードの切り替え。開いている動画を、同じ位置で開き直す。"""
+        if self.path:
+            t = self.cur_t
+            self.load(self.path)
+            self.seek_paused(t)
+
+    def renderer_label(self):
+        """統計の表示の、描画とデコードの仕方。"""
+        return self.view.renderer + (" ・ HWデコード" if self.hw_decode else "")
 
     def set_minimap(self, on):
         self.view.show_minimap = on
@@ -478,7 +501,14 @@ class MainWindow(QMainWindow):
         # GPU 描画はデコード結果の形式のまま (10bit / 4:2:2 も) 受け渡す。CPU 描画は BGRA
         self.pix_fmt = gpu_format(src.pix_fmt) if self.view.pixel_format == "yuv" else "bgra"
         self.frame_w, self.frame_h = even_size(self.pix_fmt, src.width, src.height)
-        self.decoder = Decoder(path, self.pix_fmt, self.frame_w, self.frame_h)
+        # 再生中のデコードは、間に合えばハードウェアで行う (受け取る形式は色差を交互に並べたもの)。
+        # 一時停止中のコマ送り・シーク (self.src, BackFiller) はソフトのまま
+        self.play_fmt, self.hw_decode = self.pix_fmt, False
+        if self.view.pixel_format == "yuv" and self.hw_check.isChecked():
+            probe = probe_hw(path, src.pix_fmt)
+            if probe and probe[1] >= src.fps * HW_FPS_MARGIN:
+                self.play_fmt, self.hw_decode = probe[0], True
+        self.decoder = Decoder(path, self.play_fmt, self.frame_w, self.frame_h, hw=self.hw_decode)
         if isinstance(self.view, GpuWindow):
             self.decoder.before_free = self.view.wait_copy
         self.backfill = BackFiller(path, self.pix_fmt, self.frame_w, self.frame_h)
@@ -963,7 +993,7 @@ class MainWindow(QMainWindow):
         self.update_lock()                    # ウィンドウを別の画面へ動かしたときのため
         if not self.playing:
             self.view.stats_text = (f"一時停止中\n動画 {fmt_fps(self.fps())} fps{self.forced_label()}"
-                                    f" ・ 画面 {round(hz)} Hz ・ {self.view.renderer}{self.sdi_label()}")
+                                    f" ・ 画面 {round(hz)} Hz ・ {self.renderer_label()}{self.sdi_label()}")
             self.view.stats_warn = False
         else:
             total = self.decoder.decoded.value
@@ -986,7 +1016,7 @@ class MainWindow(QMainWindow):
             self.view.stats_text = (f"描画 {shown_fps:.1f} / {want:.1f} fps{self.forced_label()}"
                                     f" ・ 先読み {ahead:.2f} 秒\n"
                                     f"{reason} ・ デコード {decoded_fps:.0f} fps ・ 画面 {round(hz)} Hz"
-                                    f" ・ {self.view.renderer}{self.sync_label()}{self.sdi_label()}")
+                                    f" ・ {self.renderer_label()}{self.sync_label()}{self.sdi_label()}")
             self.view.stats_warn = reason != "全コマ表示中"
         self.view.update()
 

@@ -5,7 +5,8 @@ from fractions import Fraction
 
 import numpy as np
 
-from player_core import WRAP, VideoSource, even_size, frame_size, gpu_format, plane_views, write_frame
+from player_core import (WRAP, VideoSource, even_size, frame_size, gpu_format, hw_device, plane_sizes, plane_views,
+                         texture_scale, write_frame, yuv_planes)
 from player_frames import BackFiller, Decoder, FrameCache, Picture
 from tests.videos import make_video, read_index_frame, read_index_picture, read_index_y
 
@@ -98,6 +99,41 @@ class FrameLayoutTest(unittest.TestCase):
     def test_even_size(self):
         self.assertEqual(even_size("yuv420p", 1921, 1081), (1920, 1080))
         self.assertEqual(even_size("bgra", 1921, 1081), (1921, 1081))
+        self.assertEqual(even_size("p210le", 1921, 1081), (1920, 1081))
+
+
+class SemiFormatTest(unittest.TestCase):
+    """ハードウェアデコードが返す、色差を交互に並べた形式 (NV12 / P010 / P210)。"""
+
+    CASES = [("nv12", "yuv420p", 8), ("p010le", "yuv420p10le", 10), ("p210le", "yuv422p10le", 10)]
+
+    def test_layout(self):
+        self.assertEqual(plane_sizes("nv12", 64, 32), [(64, 32), (64, 16)])        # CbCr は 32 組 × 16 行
+        self.assertEqual(plane_sizes("p210le", 64, 32), [(64, 32), (64, 32)])
+        self.assertEqual(frame_size("p010le", 64, 32), (64 * 32 * 2 + 64 * 16 * 2,))
+        self.assertEqual(frame_size("p210le", 64, 32), frame_size("yuv422p10le", 64, 32))
+
+    def test_texture_scale(self):
+        """10bit は 16bit の上位に詰めてあるので、最大の値 (1023 << 6) が 1 になる。"""
+        self.assertEqual(texture_scale("nv12"), 1.0)
+        self.assertAlmostEqual(texture_scale("p010le") * (1023 << 6) / 65535, 1.0)
+        self.assertAlmostEqual(texture_scale("yuv420p10le") * 1023 / 65535, 1.0)
+
+    def test_write_frame_matches_planar(self):
+        """詰めた値を Y, U, V に分けると、同じコマをプレーン形式にしたものと一致する。"""
+        src = VideoSource(make_video(Fraction(60), 120, pix_fmt="yuv422p10le"))
+        frame = src.frame_at(21 / 60, 60)
+        for semi, planar, bits in self.CASES:
+            with self.subTest(semi):
+                w, h = even_size(semi, src.width, src.height)
+                got = np.empty(frame_size(semi, w, h), np.uint8)
+                write_frame(got, frame.reformat(format=semi), semi, w, h)
+                ref = np.empty(frame_size(planar, w, h), np.uint8)
+                write_frame(ref, frame.reformat(format=planar), planar, w, h)
+                for a, b in zip(yuv_planes(got, semi, w, h), plane_views(ref, planar, w, h)):
+                    np.testing.assert_array_equal(a, b)
+                self.assertEqual(read_index_y(yuv_planes(got, semi, w, h)[0] >> (bits - 8)), 21)
+        src.close()
 
 
 class FrameCacheTest(unittest.TestCase):
@@ -160,12 +196,12 @@ class BackFillerTest(unittest.TestCase):
 class DecoderProcessTest(unittest.TestCase):
     """別プロセスのデコードから共有メモリ経由で正しいコマが順に届く。"""
 
-    def run_session(self, fmt):
+    def run_session(self, fmt, hw=False):
         path = make_video(Fraction(120), 300)
         src = VideoSource(path)
         w, h = even_size(fmt, src.width, src.height)
         src.close()
-        dec = Decoder(path, fmt, w, h)
+        dec = Decoder(path, fmt, w, h, hw=hw)
         try:
             dec.play(50 / 120, 120.0)
             got = []
@@ -223,6 +259,12 @@ class DecoderProcessTest(unittest.TestCase):
 
     def test_bgra_session(self):
         self.run_session("bgra")
+
+    def test_hw_session(self):
+        """ハードウェアデコード (NV12) でも、同じコマが順に届く。"""
+        if hw_device() is None:
+            self.skipTest("この PC ではハードウェアデコードを使えない")
+        self.run_session("nv12", hw=True)
 
 
 if __name__ == "__main__":

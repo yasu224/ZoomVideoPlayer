@@ -3,6 +3,7 @@
 再生用のデコードは別プロセスで動かす。そのプロセスが Qt を読み込まずに済むよう、
 画面 (PySide6) とは別のモジュールにしている。
 """
+import functools
 import math
 import queue
 import time
@@ -17,8 +18,17 @@ class VideoSource:
     同時に使うのは 1 スレッドだけ (再生中はデコードスレッド、停止中は GUI スレッド)。
     """
 
-    def __init__(self, path):
-        self.container = av.open(path)
+    def __init__(self, path, hw=False):
+        """hw なら GPU (ハードウェア) でデコードする (hw_device)。使えなければ例外になる (ソフトに切り替えない)。"""
+        if hw:
+            from av.codec.hwaccel import HWAccel
+            device = hw_device()
+            if device is None:
+                raise RuntimeError("ハードウェアデコードを使えません")
+            self.container = av.open(path, hwaccel=HWAccel(device_type=device, allow_software_fallback=False))
+        else:
+            self.container = av.open(path)
+        self.hw = hw
         if not self.container.streams.video:
             raise ValueError("映像トラックがありません")
         self.stream = self.container.streams.video[0]
@@ -165,6 +175,8 @@ class SharedClock:
 # 受け渡すフレームの形式。
 #   YUV のプレーン形式 (PLANAR にあるもの): デコード結果を変換せずにそのまま渡し、GPU で RGB に
 #       変換・拡大縮小する。10bit や 4:2:2 (XAVC などの業務用カメラ) も CPU で変換しない
+#   色差を交互に並べた形式 (SEMI にあるもの): ハードウェアデコードの結果。Y のプレーンと、Cb Cr を
+#       交互に並べた 1 枚のプレーン。10bit は 16bit の上位に詰めてある。これも変換せずに GPU へ渡す
 #   "bgra": CPU で RGB に変換して Qt に描かせる (OpenGL が使えない PC 向け)
 # 名前: (色差の横の縮み, 縦の縮み, 1 画素のバイト数, ビット数)。縮みは 2 のべき (1 なら半分)
 PLANAR = {
@@ -176,14 +188,85 @@ PLANAR = {
 }
 
 
+SEMI = {"nv12": (1, 1, 1, 8), "p010le": (1, 1, 2, 10), "p210le": (1, 0, 2, 10)}
+YUV_FORMATS = {**PLANAR, **SEMI}
+# ハードウェアデコードで受け取る形式 (デコード結果の形式 → ハードウェアが返す形式)
+HW_FORMATS = {"yuv420p": "nv12", "yuvj420p": "nv12", "yuv420p10le": "p010le", "yuv422p10le": "p210le"}
+HW_DEVICES = ("videotoolbox", "d3d11va", "dxva2")     # macOS / Windows で使うもの (先にあるほうを使う)
+
+
+@functools.lru_cache(maxsize=1)
+def hw_device():
+    """この PC で使えるハードウェアデコードの種類。無ければ None。"""
+    try:
+        from av.codec.hwaccel import hwdevices_available
+        available = hwdevices_available()
+    except Exception:
+        return None
+    return next((d for d in HW_DEVICES if d in available), None)
+
+
+def texture_scale(fmt):
+    """GPU のテクスチャの値 (8bit は 255、16bit は 65535 を 1 とする) を、bits ビットの最大値が 1 に
+    なるよう直す倍率。色差を交互に並べた形式の 10bit は 16bit の上位に詰めてあるので、その分も直す。"""
+    _, _, bps, bits = YUV_FORMATS[fmt]
+    if bps == 1:
+        return 1.0
+    top = (1 << bits) - 1
+    return 65535 / (top << (16 - bits) if fmt in SEMI else top)
+
+
+def probe_hw(path, source_fmt, frames=16):
+    """path をハードウェアでデコードできるか確かめる。(受け取る形式, 再生で出せる fps) か None。
+
+    ハードウェアのデコーダーは 1 コマずつ順に解くので、4K 10bit などでは 60fps 前後が限界になる。
+    再生と同じように共有メモリへ写すところまで含めて測り、呼んだ側が再生に要る fps と比べて決める。
+    """
+    import numpy as np
+
+    want = HW_FORMATS.get(source_fmt)
+    if want is None or hw_device() is None:
+        return None
+    try:
+        src = VideoSource(path, hw=True)
+    except Exception:
+        return None
+    try:
+        w, h = even_size(want, src.width, src.height)
+        dst = np.empty(frame_size(want, w, h), np.uint8)
+        times = []
+        for _ in range(frames):
+            frame = src.next()
+            if frame is None:                # 短い動画: 測れるだけ測る
+                break
+            if frame.format.name != want:
+                return None
+            write_frame(dst, frame, want, w, h)
+            times.append(time.perf_counter())
+        if not times:
+            return None
+        # 最初の数コマはデコーダーの準備を含むので除く。測れるほどコマが無ければ間に合うとみなす
+        skip = 4
+        if len(times) < skip + 3:
+            return want, float("inf")
+        return want, (len(times) - 1 - skip) / (times[-1] - times[skip])
+    except Exception:
+        return None
+    finally:
+        src.close()
+
+
 def gpu_format(source_fmt):
     """GPU 描画で受け渡す形式。そのまま扱えない形式 (NV12 や RGB など) は yuv420p に変換する。"""
     return source_fmt if source_fmt in PLANAR else "yuv420p"
 
 
 def plane_sizes(fmt, width, height):
-    """Y・U・V 各プレーンの (幅, 高さ)。"""
-    sx, sy, _, _ = PLANAR[fmt]
+    """各プレーンの (1 行の値の数, 行数)。Y・U・V の 3 枚か、色差を交互に並べた形式なら Y・CbCr の 2 枚
+    (CbCr は 1 行に Cb と Cr を交互に並べるので、値の数は色差の幅の 2 倍)。"""
+    sx, sy, _, _ = YUV_FORMATS[fmt]
+    if fmt in SEMI:
+        return [(width, height), ((width >> sx) * 2, height >> sy)]
     return [(width, height), (width >> sx, height >> sy), (width >> sx, height >> sy)]
 
 
@@ -191,7 +274,7 @@ def frame_size(fmt, width, height):
     """フレームを置く配列の形。YUV は 3 プレーンを詰めて並べた 1 次元のバイト列。"""
     if fmt == "bgra":
         return (height, width, 4)
-    bps = PLANAR[fmt][2]
+    bps = YUV_FORMATS[fmt][2]
     return (sum(w * h for w, h in plane_sizes(fmt, width, height)) * bps,)
 
 
@@ -199,7 +282,7 @@ def even_size(fmt, width, height):
     """色差が縮む向きは偶数にそろえる (はみ出す 1 画素は表示しない)。"""
     if fmt == "bgra":
         return (width, height)
-    sx, sy, _, _ = PLANAR[fmt]
+    sx, sy, _, _ = YUV_FORMATS[fmt]
     return (width & ~((1 << sx) - 1), height & ~((1 << sy) - 1))
 
 
@@ -207,7 +290,7 @@ def plane_views(data, fmt, width, height):
     """詰めて並べたバイト列 data を、プレーンごとの 2 次元配列 (8bit は uint8、それ以上は uint16) で見る。"""
     import numpy as np
 
-    bps = PLANAR[fmt][2]
+    bps = YUV_FORMATS[fmt][2]
     dtype = np.uint8 if bps == 1 else np.uint16
     views, offset = [], 0
     for w, h in plane_sizes(fmt, width, height):
@@ -215,6 +298,16 @@ def plane_views(data, fmt, width, height):
         views.append(data[offset:offset + n].view(dtype).reshape(h, w))
         offset += n
     return views
+
+
+def yuv_planes(data, fmt, width, height):
+    """Y, U, V の 3 枚の 2 次元配列 (確認用)。色差を交互に並べた形式は Cb Cr に分け、10bit は下位に戻す。"""
+    views = plane_views(data, fmt, width, height)
+    if fmt not in SEMI:
+        return views
+    y, uv = views
+    shift = 16 - YUV_FORMATS[fmt][3] if YUV_FORMATS[fmt][2] == 2 else 0
+    return [y >> shift, uv[:, 0::2] >> shift, uv[:, 1::2] >> shift]
 
 
 def write_frame(dst, frame, fmt, width, height):
@@ -226,7 +319,7 @@ def write_frame(dst, frame, fmt, width, height):
         return
     if frame.format.name != fmt or frame.width < width or frame.height < height:
         frame = frame.reformat(format=fmt, width=width, height=height)      # 遅い道 (形式が違うときだけ)
-    bps = PLANAR[fmt][2]
+    bps = YUV_FORMATS[fmt][2]
     offset = 0
     # 各プレーンは行末に詰め物があるので、見える幅だけを詰めて写す
     for plane, (cols, rows) in zip(frame.planes, plane_sizes(fmt, width, height)):
@@ -301,7 +394,8 @@ def attach_shared_memory(name):
         resource_tracker.register = register
 
 
-def decode_worker(path, fmt, shm_name, slots, cmd_q, ready_q, free_q, clock_values, decoded, sent, started):
+def decode_worker(path, fmt, shm_name, slots, cmd_q, ready_q, free_q, clock_values, decoded, sent, started,
+                  hw=False):
     """再生用のデコードを続ける。命令: ("play", セッション, 開始秒, fps, ループ) / ("stop",) / ("quit",)
 
     ループは None (しない) か (A 秒, B 秒)。B が None なら終端まで再生して A へ戻る。
@@ -310,7 +404,7 @@ def decode_worker(path, fmt, shm_name, slots, cmd_q, ready_q, free_q, clock_valu
 
     ready_q = _CountedQueue(ready_q, sent)
     shm = attach_shared_memory(shm_name)
-    src = VideoSource(path)
+    src = VideoSource(path, hw=hw)
     w, h = even_size(fmt, src.width, src.height)
     shape = frame_size(fmt, w, h)
     nbytes = int(np.prod(shape))

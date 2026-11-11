@@ -68,12 +68,12 @@ def read_index_y(y_plane):
 
 
 def read_index_picture(picture):
-    """画面側の Picture (YUV のプレーン形式か bgra) からフレーム番号を読む。"""
-    from player_core import PLANAR, plane_views
+    """画面側の Picture (YUV の形式か bgra) からフレーム番号を読む。"""
+    from player_core import YUV_FORMATS, yuv_planes
     if picture.fmt == "bgra":
         return read_index_y(picture.data[:, :, 1])      # BGRA の G (白黒なので R/G/B は同じ)
-    y = plane_views(picture.data, picture.fmt, picture.w, picture.h)[0]
-    return read_index_y(y >> (PLANAR[picture.fmt][3] - 8))
+    y = yuv_planes(picture.data, picture.fmt, picture.w, picture.h)[0]
+    return read_index_y(y >> (YUV_FORMATS[picture.fmt][3] - 8))
 
 
 def read_index_frame(av_frame):
