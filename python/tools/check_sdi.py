@@ -70,18 +70,25 @@ def unpack(raw, w, h, row_bytes, ten_bit):
 
 
 def random_picture(fmt, w, h, seed):
+    """乱数の YUV のコマ。色差を交互に並べた形式 (ハードウェアデコードの結果) も作れる。"""
     import numpy as np
 
-    from player_core import PLANAR, frame_size, plane_views
+    from player_core import SEMI, YUV_FORMATS, frame_size, plane_views
     from player_frames import Picture
     rng = np.random.default_rng(seed)
-    bits = PLANAR[fmt][3]
+    sx, sy, _, bits = YUV_FORMATS[fmt]
     unit = 1 << (bits - 8)
+    y = rng.integers(16 * unit, 235 * unit + 1, (h, w))
+    u = rng.integers(16 * unit, 240 * unit + 1, (h >> sy, w >> sx))
+    v = rng.integers(16 * unit, 240 * unit + 1, (h >> sy, w >> sx))
     data = np.zeros(frame_size(fmt, w, h), np.uint8)
-    y, u, v = plane_views(data, fmt, w, h)
-    y[:] = rng.integers(16 * unit, 235 * unit + 1, y.shape)
-    u[:] = rng.integers(16 * unit, 240 * unit + 1, u.shape)
-    v[:] = rng.integers(16 * unit, 240 * unit + 1, v.shape)
+    planes = plane_views(data, fmt, w, h)
+    if fmt in SEMI:                    # 10bit は 16bit の上位に詰める
+        shift = 16 - bits if YUV_FORMATS[fmt][2] == 2 else 0
+        planes[0][:] = y << shift
+        planes[1][:, 0::2], planes[1][:, 1::2] = u << shift, v << shift
+    else:
+        planes[0][:], planes[1][:], planes[2][:] = y, u, v
     return Picture(float(seed), fmt, w, h, data)
 
 
@@ -89,11 +96,11 @@ def expected_packed(pic, ten_bit, row_bytes):
     """ピクセル表示 (最近傍) の等倍で描いたときの、正しいバイト列 (player_sdi.pack_reference)。"""
     import numpy as np
 
-    from player_core import PLANAR, plane_views
+    from player_core import YUV_FORMATS, yuv_planes
     from player_sdi import pack_reference
     from player_view import yuv_matrix
-    sx, sy, _, bits = PLANAR[pic.fmt]
-    y, u, v = (p.astype(np.float64) for p in plane_views(pic.data, pic.fmt, pic.w, pic.h))
+    sx, sy, _, bits = YUV_FORMATS[pic.fmt]
+    y, u, v = (p.astype(np.float64) for p in yuv_planes(pic.data, pic.fmt, pic.w, pic.h))
     u = np.repeat(np.repeat(u, 1 << sx, axis=1), 1 << sy, axis=0)
     v = np.repeat(np.repeat(v, 1 << sx, axis=1), 1 << sy, axis=0)
     top = (1 << bits) - 1
@@ -124,7 +131,8 @@ def main():
 
     # 1. 詰め方
     cases = [("yuv422p10le", 1920, 1080, True), ("yuv422p10le", 1920, 1080, False),
-             ("yuv420p", 1920, 1080, True), ("yuv420p", 1280, 720, True), ("yuv420p", 1280, 720, False)]
+             ("yuv420p", 1920, 1080, True), ("yuv420p", 1280, 720, True), ("yuv420p", 1280, 720, False),
+             ("p210le", 1920, 1080, True), ("nv12", 1920, 1080, True), ("nv12", 1280, 720, False)]
     for n, (fmt, pw, ph, ten_bit) in enumerate(cases):
         pic = random_picture(fmt, pw, ph, n + 1)
         view.set_color(True, False)

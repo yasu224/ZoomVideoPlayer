@@ -77,18 +77,17 @@ def main():
         print("GPU 描画になっていません。OpenGL が使えない可能性があります。")
         return 1
 
-    # 1. 色 (8bit 4:2:0 と、業務用カメラと同じ 10bit 4:2:2)
-    from player_core import PLANAR, plane_views
-    for pix_fmt in ("yuv420p", "yuv422p10le"):
-        path, _ = make_bars(pix_fmt=pix_fmt)
-        w.load(path)
-        wait(0.5)
+    # 1. 色 (8bit 4:2:0 と、業務用カメラと同じ 10bit 4:2:2)。一時停止中 (ソフトでデコード) と、
+    #    ハードウェアデコードで再生したコマ (色差を交互に並べた形式) の両方
+    from player_core import YUV_FORMATS, hw_device, yuv_planes
+
+    def color_error():
         shot = w.view.grabFramebuffer()
         dpr = shot.devicePixelRatio()
         rect = w.view.image_rect()
         pic = w.cur_frame
-        bits = PLANAR[pic.fmt][3]
-        y, u, v = plane_views(pic.data, pic.fmt, pic.w, pic.h)
+        bits = YUV_FORMATS[pic.fmt][3]
+        y, u, v = yuv_planes(pic.data, pic.fmt, pic.w, pic.h)
         worst = 0
         for i in range(8):
             fx, fy = (i + 0.5) / 8, 0.5
@@ -98,7 +97,24 @@ def main():
             c = shot.pixelColor(int((rect.left() + fx * rect.width()) * dpr), int((rect.top() + fy * rect.height()) * dpr))
             expected = bt709_rgb(yy, uu, vv, bits)
             worst = max(worst, max(abs(a - b) for a, b in zip(expected, (c.red(), c.green(), c.blue()))))
-        results.append((f"色 {pic.fmt} (BT.709 との最大差)", f"{worst} 段階", worst <= 2))
+        return pic.fmt, worst
+
+    use_hw = hw_device() is not None
+    margin = player_gui.HW_FPS_MARGIN
+    player_gui.HW_FPS_MARGIN = 0.0                  # 確かめるために、速さによらずハードウェアを使う
+    for pix_fmt in ("yuv420p", "yuv422p10le"):
+        path, _ = make_bars(pix_fmt=pix_fmt)
+        w.load(path)
+        wait(0.5)
+        fmt, worst = color_error()
+        results.append((f"色 {fmt} (BT.709 との最大差)", f"{worst} 段階", worst <= 2))
+        if use_hw:
+            # 最後まで再生すると止まり、ハードウェアで解いたコマ (再生用の形式) がそのまま残る
+            w.play()
+            wait(1.0)
+            fmt, worst = color_error()
+            results.append((f"色 HW デコード {fmt} (BT.709 との最大差)", f"{worst} 段階",
+                            worst <= 2 and w.hw_decode and fmt != pix_fmt))
 
     # 2. コマ (GPU が描いた絵に出ている番号)
     path = make_video(Fraction(120), 600, size=(1920, 1080), gop=120, crf=18)
@@ -116,6 +132,19 @@ def main():
     results.append(("コマ送り (25 回、キーフレームをまたぐ)", f"ずれ {len(wrong)} 回", not wrong))
     slowest = max(delays[1:]) * 1000      # 最初の 1 回はまとめてデコードする分を含む
     results.append(("コマ送りから表示までの時間 (最大)", f"{slowest:.0f} ms", slowest < 100))
+    if use_hw:
+        # ハードウェアデコードで再生して止めたとき、出ているコマが位置どおりか
+        wrong = []
+        for start in (40, 250, 470):
+            w.seek_paused(start / 120)
+            w.play()
+            wait(0.6)
+            w.pause()
+            got = grab_index(w)
+            if got != w.frame_index():
+                wrong.append((w.frame_index(), got))
+        results.append(("HW デコードで再生して止めたコマ (3 回)", f"ずれ {len(wrong)} 回", w.hw_decode and not wrong))
+    player_gui.HW_FPS_MARGIN = margin
 
     # 3. 速さ (120fps と、144Hz の画面と同じ 144fps と、画面の Hz を超える 240fps)
     hz = screen.refreshRate()

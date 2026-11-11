@@ -174,7 +174,8 @@ class Decoder:
     スロットの数だけデコードが先へ進める (先読みの貯め)。1 つの共有メモリを区切って使う。
     """
 
-    def __init__(self, path, fmt, width, height):
+    def __init__(self, path, fmt, width, height, hw=False):
+        """hw なら、デコード用プロセスはハードウェアでデコードする (fmt はハードウェアが返す形式)。"""
         ctx = mp.get_context("spawn")
         shape = frame_size(fmt, width, height)
         nbytes = int(np.prod(shape))
@@ -194,7 +195,7 @@ class Decoder:
         self.proc = ctx.Process(
             target=decode_worker, daemon=True,
             args=(path, fmt, self.shm.name, self.slots, self.cmd_q, self.ready_q, self.free_q,
-                  self.clock.values, self.decoded, self.sent, self.started))
+                  self.clock.values, self.decoded, self.sent, self.started, hw))
         self.proc.start()
         self.session = 0
         self.active = False      # 実行中のセッションがある (SESSION_END 未着)
