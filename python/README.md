@@ -104,6 +104,7 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `player_frames.py` | 画面側のフレーム、停止中のコマの記憶、デコードプロセスとの受け渡し |
 | `player_core.py` | デコード（PyAV）。再生中は別プロセスで動く |
 | `player_vsync.py` | 画面の書き換え（垂直同期）に合わせたコマの選び方 |
+| `player_os.py` | OS ごとの違いがある処理（画面のスレッドの優先度、裏に回っても OS に遅らせない設定） |
 | `player_sdi.py` | Blackmagic SDI 出力（機器の一覧、送るスレッド、出力の拡大の置き換え） |
 | `sdi/decklink_bridge.cpp`, `build_sdi_mac.sh` / `build_sdi.bat` | DeckLink SDK を呼ぶライブラリとそのビルド（macOS / Windows） |
 | `tools/check_sdi.py` | SDI 出力の確認（詰め方と、機器へ送れたコマ数） |

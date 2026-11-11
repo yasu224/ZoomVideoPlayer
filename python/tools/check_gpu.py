@@ -1,4 +1,5 @@
 """本物の画面で GPU 描画を確かめる: .venv\\Scripts\\python.exe tools\\check_gpu.py [画面番号]
+(macOS は .venv/bin/python tools/check_gpu.py [画面番号])
 
 1. 色: 値の分かっている色の帯を GPU で描き、BT.709 の計算結果と比べる
 2. コマ: コマ送りしたとき、GPU が描いた絵に正しいフレーム番号が出ているか
