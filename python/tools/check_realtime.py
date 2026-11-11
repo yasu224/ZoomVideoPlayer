@@ -1,4 +1,5 @@
 """再生のリアルタイム性を測る: .venv\\Scripts\\python.exe tools\\check_realtime.py [画面番号] [--fps 144]
+(macOS は .venv/bin/python tools/check_realtime.py [画面番号] [--fps 144])
 
 フレーム番号入りの 1080p 動画 (既定 120fps、--fps で変えられる) を再生し、画面に出たコマの番号を毎回読んで数える。
 - 飛んだコマ数と、表示が止まった最長時間 (等速 8 秒)
