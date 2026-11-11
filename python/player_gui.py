@@ -140,6 +140,105 @@ def raise_ui_thread_priority():
     kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
 
 
+class KeepRunning:
+    """見えていない (最小化・ほかのウィンドウの後ろ) 間も、タイマーを遅らせずに動かしてもらう。
+
+    SDI 出力中はモニターを見ていてアプリを裏に回すことがあるが、OS は見えていないアプリの
+    タイマーをまとめて遅らせたり (macOS の App Nap とタイマーの合体)、遅くしたり (Windows 11 の
+    効率モード) する。そうなると出力のコマが間に合わず、同じ絵が続く。
+    macOS: NSProcessInfo の beginActivityWithOptions (ユーザーが始めた、遅れの許されない処理)。
+    Windows: SetProcessInformation の電力の抑制 (実行速度とタイマーの精度) を外す。
+    """
+
+    # macOS: NSActivityUserInitiated | NSActivityLatencyCritical
+    MAC_OPTIONS = 0x00FFFFFF | 0xFF00000000
+
+    def __init__(self):
+        self.token = None
+
+    def start(self, reason):
+        if self.token is not None:
+            return
+        try:
+            if sys.platform == "darwin":
+                self.token = self._mac_begin(reason)
+            elif sys.platform == "win32":
+                self._win_throttle(False)
+                self.token = True
+        except Exception as e:          # 動かなくても再生は続ける
+            print(f"裏に回ったときの遅れを止められません: {e}")
+
+    def stop(self):
+        if self.token is None:
+            return
+        try:
+            if sys.platform == "darwin":
+                self._mac_end(self.token)
+            elif sys.platform == "win32":
+                self._win_throttle(True)
+        except Exception as e:
+            print(f"裏に回ったときの設定を戻せません: {e}")
+        self.token = None
+
+    # ---------- macOS (Objective-C のランタイムを ctypes で呼ぶ) ----------
+    @staticmethod
+    def _objc():
+        import ctypes
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+
+        def msg(restype, *argtypes):
+            # arm64 では objc_msgSend を引数の型どおりの関数として呼ぶ必要がある
+            return ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(send)
+        return ctypes, objc, msg
+
+    def _mac_process_info(self):
+        ctypes, objc, msg = self._objc()
+        cls = objc.objc_getClass(b"NSProcessInfo")
+        return ctypes, objc, msg, msg(ctypes.c_void_p)(cls, objc.sel_registerName(b"processInfo"))
+
+    def _mac_begin(self, reason):
+        ctypes, objc, msg, info = self._mac_process_info()
+        text = msg(ctypes.c_void_p, ctypes.c_char_p)(
+            objc.objc_getClass(b"NSString"), objc.sel_registerName(b"stringWithUTF8String:"), reason.encode())
+        token = msg(ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p)(
+            info, objc.sel_registerName(b"beginActivityWithOptions:reason:"), self.MAC_OPTIONS, text)
+        if not token:
+            raise RuntimeError("beginActivityWithOptions に失敗しました")
+        msg(ctypes.c_void_p)(token, objc.sel_registerName(b"retain"))      # stop まで持っておく
+        return token
+
+    def _mac_end(self, token):
+        ctypes, objc, msg, info = self._mac_process_info()
+        msg(None, ctypes.c_void_p)(info, objc.sel_registerName(b"endActivity:"), token)
+        msg(None)(token, objc.sel_registerName(b"release"))
+
+    # ---------- Windows ----------
+    @staticmethod
+    def _win_throttle(allow):
+        import ctypes
+        from ctypes import wintypes
+
+        class PowerThrottling(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+        ProcessPowerThrottling = 4
+        mask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        # ControlMask の項目を OS に任せる (allow) か、StateMask=0 で抑制しないと決める
+        state = PowerThrottling(1, 0 if allow else mask, 0)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        if not kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), ProcessPowerThrottling,
+                                              ctypes.byref(state), ctypes.sizeof(state)):
+            raise OSError(ctypes.get_last_error(), "SetProcessInformation")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -167,6 +266,7 @@ class MainWindow(QMainWindow):
         self.cache = FrameCache()    # 停止中に見たコマ (戻るコマ送りを速くする)
         self.scrub_value = None      # シークバーをドラッグ中の、まだ表示していない位置
         self.sdi = None              # SDI 出力 (player_sdi.SdiOutput)
+        self.keep_running = KeepRunning()   # SDI 出力中は、裏に回っても OS に遅らせない
         self.sdi_sent_mark = 0       # 統計の表示で、前回までに送ったコマ数
         self.stats_dt = 0.5          # 統計の表示の間隔 (秒)
 
@@ -174,6 +274,11 @@ class MainWindow(QMainWindow):
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.setInterval(2)
         self.timer.timeout.connect(self.on_timer)
+        self.view_shown = True        # GPU 描画のウィンドウが見えているか (on_swapped)
+        self.hidden_paint = QTimer(self)          # 見えていない間に、画面の Hz の間隔で描く
+        self.hidden_paint.setSingleShot(True)
+        self.hidden_paint.setTimerType(Qt.PreciseTimer)
+        self.hidden_paint.timeout.connect(lambda: self.playing and self.view.render_soon())
         self.last_swap = 0.0
         self.vsync = VsyncTimer()     # 書き換えの時刻 (揺れを除いたもの)
         self.swap_wall = None         # 直前の書き換えの推定時刻。再生中のコマはこの時刻を基準に選ぶ
@@ -413,6 +518,7 @@ class MainWindow(QMainWindow):
         self.sdi_sent_mark = 0
         self.view.set_sdi(self.sdi)
         self.update_sdi_sequence()
+        self.keep_running.start("SDI 出力")
 
     def show_sdi_off(self):
         """メニューを「オフ」に戻す (出力を選び直したことにはしない)。"""
@@ -435,6 +541,7 @@ class MainWindow(QMainWindow):
             self.view.set_sdi(None)
         self.sdi.close()
         self.sdi = None
+        self.keep_running.stop()
 
     def sdi_label(self):
         """統計の表示に足す SDI 出力の様子。"""
@@ -809,10 +916,19 @@ class MainWindow(QMainWindow):
     # GPU 描画では、コマを選ぶのは画面の書き換えの直後だけにする。基準の時刻は、書き換えの知らせの
     # 届いた時刻から揺れを除いた推定 (VsyncTimer)。再生中は毎回描き直して、この流れを途切れさせない。
     # タイマーは、書き換えが止まっているときに描き直しを頼むためだけに使う。
+    # ウィンドウが最小化されたり、ほかのウィンドウに隠れたりして見えていない間は、書き換えが画面に
+    # 合わせて待たず、すぐ終わる (macOS / Windows とも)。書き換えの回数で進めると再生が速くなり、
+    # 描き続けると CPU を無駄に使うので、その間は壁時計で進め、画面の Hz の間隔で描く。
+    # SDI 出力はこの間も描いて送る。
     def on_swapped(self):
         self.last_swap = time.perf_counter()
         if self.playing:
-            self.swap_wall = self.vsync.update(self.last_swap, 1 / self.hz)
+            shown = self.view.isExposed()
+            if shown != self.view_shown:            # 見える・見えないが変わった: 合わせ方を切り替える
+                self.view_shown = shown
+                self.vsync.reset()
+                self.update_lock()
+            self.swap_wall = self.vsync.update(self.last_swap, 1 / self.hz) if shown else self.last_swap
             clock = self.decoder.clock
             lock = self.lock
             if lock and lock.t is not None and clock.started:
@@ -825,7 +941,10 @@ class MainWindow(QMainWindow):
                     lock.rebase(self.swap_wall, t)
                 # デコード側の間引きに、次の書き換えの時刻を知らせる
                 clock.set_next_vsync(t + self.lookahead())
-            self.view.render_soon()
+            if shown:
+                self.view.render_soon()
+            else:
+                self.hidden_paint.start(max(1, round(1000 / self.hz)))
 
     def on_timer(self):
         if not isinstance(self.view, GpuWindow):
@@ -836,7 +955,8 @@ class MainWindow(QMainWindow):
     def update_lock(self):
         """動画と画面の速さがほぼ同じ (か整数倍) なら、画面の書き換えに合わせて進める (vsync_lock_step)。"""
         gpu = isinstance(self.view, GpuWindow)
-        step = vsync_lock_step(self.fps(), self.speed(), self.hz) if gpu else None
+        # 見えていない間は書き換えが画面に合わせて待たないので、合わせない (on_swapped)
+        step = vsync_lock_step(self.fps(), self.speed(), self.hz) if gpu and self.view_shown else None
         if step is None:
             self.lock = None
         elif not self.lock or (self.lock.step, self.lock.speed) != (step, self.speed()):

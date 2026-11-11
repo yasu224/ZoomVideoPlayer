@@ -14,16 +14,23 @@ macOS（Python 3.10 以上が必要。`python3` が使えること）:
 - ターミナルでこのフォルダへ移動して `bash run_mac.sh [動画ファイル]`（初回だけ `.venv` を作ります）
 - 動画はウィンドウにドロップしても開けます
 
-## Blackmagic SDI 出力（macOS）
+## Blackmagic SDI 出力（macOS / Windows）
 
 DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器も含む）の SDI へ、画面で拡大している範囲を出せます。
 
-準備:
+準備（macOS）:
 1. Blackmagic Desktop Video（ドライバ）を入れ、システム設定 → 一般 → ログイン項目と機能拡張 → ドライバ機能拡張 で
-   Blackmagic のドライバを許可する（Desktop Video Setup で機器が見えれば OK）
+   Blackmagic のドライバ（BlackmagicIO）を許可する（Desktop Video Setup で機器が見えれば OK）
 2. Blackmagic の「Desktop Video SDK」を入手して展開し、`bash build_sdi_mac.sh <SDK のフォルダ>` で
    `sdi/libzvp_decklink.dylib` を作る（SDK のフォルダを省くと、リポジトリの隣の `Blackmagic DeckLink SDK *` を探す）。
    `build_mac.sh` で .app を作るときも、このライブラリを一緒に入れる
+
+準備（Windows）:
+1. Blackmagic Desktop Video（ドライバ）を入れる（Desktop Video Setup で機器が見えれば OK）
+2. Visual Studio か Build Tools の「C++ によるデスクトップ開発」を入れる（SDK の `.idl` からヘッダを作る `midl` と、
+   コンパイラの `cl` を使う）
+3. 「Desktop Video SDK」を展開し、`build_sdi.bat <SDK のフォルダ>` で `sdi\zvp_decklink.dll` を作る
+   （フォルダを省いたときの探し方は macOS と同じ）。`build.bat` で exe を作るときも、このライブラリを一緒に入れる
 
 使い方:
 - 上の「SDI出力」で出力形式（解像度・fps）を選ぶ。メニューは開くたびに機器を探し直す。「オフ」で止める
@@ -42,7 +49,10 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 - M1 で 4K 59.94fps（10bit 4:2:2 も）の動画を 2160p で出すと、画面の書き換えを 1 秒に数回取りこぼすが
   （メモリと CPU をほぼ使い切る）、出力には画面に出たコマが順番に並ぶので全コマ出る
 - 右上のバッジに「SDI 形式 ・ 送ったコマ ○ / 秒」が出る
-- GPU 描画のときだけ使える。Windows には今は対応していない
+- ウィンドウを最小化したり、ほかのウィンドウの後ろに隠したりしても、再生と SDI 出力は等速で続く。
+  SDI 出力中は、見えていないアプリのタイマーを OS が遅らせないようにしている
+  （macOS の App Nap とタイマーの合体、Windows 11 の効率モード）。macOS ではその間、スリープもしない
+- GPU 描画のときだけ使える
 
 確認: `.venv/bin/python tools/check_sdi.py` で、GPU が詰めたバイト列が計算どおりか（機器なしで確認）と、
 機器がつながっていれば実際に送れたコマ数を確かめます。
@@ -95,7 +105,7 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `player_core.py` | デコード（PyAV）。再生中は別プロセスで動く |
 | `player_vsync.py` | 画面の書き換え（垂直同期）に合わせたコマの選び方 |
 | `player_sdi.py` | Blackmagic SDI 出力（機器の一覧、送るスレッド、出力の拡大の置き換え） |
-| `sdi/decklink_bridge.cpp`, `build_sdi_mac.sh` | DeckLink SDK を呼ぶライブラリとそのビルド |
+| `sdi/decklink_bridge.cpp`, `build_sdi_mac.sh` / `build_sdi.bat` | DeckLink SDK を呼ぶライブラリとそのビルド（macOS / Windows） |
 | `tools/check_sdi.py` | SDI 出力の確認（詰め方と、機器へ送れたコマ数） |
 | `tests/`, `run_tests.py`, `run_tests.bat`, `run_tests.sh` | 自動テスト |
 | `tools/check_gpu.py` | 本物の画面での GPU 描画の確認 |
@@ -127,6 +137,9 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
   「書き換えに合わせて進行」と出ます)。144Hz と表示される画面も実際は 143.97Hz などとわずかにずれていて、
   壁時計で選ぶとコマの切り替わりと書き換えが重なった所でコマ飛びと二度出しが続くためです。
   本当に描画が遅れて書き換えを飛ばしたときだけ、壁時計との差で追いつきます。
+- ウィンドウが見えていない (最小化・ほかのウィンドウの後ろ) 間は、画面の書き換えが垂直同期を待たずに
+  すぐ終わるので、書き換えに合わせて進める (VsyncLock) のをやめて壁時計で進め、画面の Hz の間隔で描きます。
+  書き換えの回数で進めたままだと、再生が 1.3 倍ほど速くなっていました。
 - 再生中のデコードは別プロセスで行い、フレームを共有メモリ経由で受け取ります。
   同じプロセスのスレッドだと Python の GIL を画面側と奪い合い、描画が止まるためです。
 - 共有メモリのスロットはデコードキャッシュ (先読みの貯め) を兼ねます。256MB まで (1080p の YUV で

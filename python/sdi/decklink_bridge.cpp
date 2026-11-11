@@ -1,14 +1,20 @@
 // Blackmagic DeckLink / UltraStudio へ映像を出すための小さなライブラリ (Python の ctypes から呼ぶ)。
-// ビルドは ../build_sdi_mac.sh。DeckLink SDK のヘッダと DeckLinkAPIDispatch.cpp を使う。
+// ビルドは macOS が ../build_sdi_mac.sh (SDK のヘッダと DeckLinkAPIDispatch.cpp を使う)、
+// Windows が ../build_sdi.bat (SDK の DeckLinkAPI.idl から midl で作ったヘッダと DeckLinkAPI_i.c を使う)。
+// OS の違い (機器の一覧の作り方、文字列、COM の初期化) は下の「OS ごとの違い」にまとめてある。
 //
 // 出し方は「予約出力」(ScheduleVideoFrame)。コマの切り替えは機器が正確に行うので、絵が届くのが
 // 多少遅れても出力のコマの間隔は乱れない。予約の仕方は 2 通り (zvp_dl_send の tag):
 // - 出力のコマ F のために描いた絵を、F + latency コマ目に出す (停止中など)
 // - 前に予約した絵のすぐ後ろへ順番に並べる (再生中で、動画と出力の fps が整数倍のとき)
 // 新しい絵が来ない間 (一時停止中など) は、最後の絵を予約し続ける (hold_last)。
-#include "DeckLinkAPI.h"
-
+#ifdef _WIN32
+#include <windows.h>
+#include "DeckLinkAPI.h"         // midl が DeckLinkAPI.idl から作るヘッダ
+#else
 #include <CoreFoundation/CoreFoundation.h>
+#include "DeckLinkAPI.h"
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -16,17 +22,48 @@
 #include <string>
 #include <vector>
 
-#define ZVP_EXPORT extern "C" __attribute__((visibility("default")))
-
 namespace {
 
-struct Device {
-    IDeckLink* deckLink;
-    std::string name;
-};
+// ---------- OS ごとの違い ----------
+#ifdef _WIN32
+#define ZVP_EXPORT extern "C" __declspec(dllexport)
+#define ZVP_CALL STDMETHODCALLTYPE
+typedef BSTR dl_string;
+typedef BOOL dl_bool;
 
-std::vector<Device> g_devices;
-std::mutex g_lock;
+// DeckLink の文字列 (BSTR) を UTF-8 にして手放す
+std::string to_string(BSTR s) {
+    if (!s)
+        return "";
+    int wlen = (int)SysStringLen(s);
+    int len = WideCharToMultiByte(CP_UTF8, 0, s, wlen, nullptr, 0, nullptr, nullptr);
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s, wlen, &out[0], len, nullptr, nullptr);
+    SysFreeString(s);
+    return out;
+}
+
+// COM は呼ぶスレッドごとに初期化が要る (画面のスレッドと、送るスレッドから呼ばれる)。
+// Qt の画面のスレッドはすでに STA で初期化しているので、そのときは何もしない
+void com_init() {
+    thread_local bool done = false;
+    if (!done) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        done = true;
+    }
+}
+
+IDeckLinkIterator* create_iterator() {
+    IDeckLinkIterator* it = nullptr;
+    if (CoCreateInstance(CLSID_CDeckLinkIterator, nullptr, CLSCTX_ALL, IID_IDeckLinkIterator, (void**)&it) != S_OK)
+        return nullptr;
+    return it;
+}
+#else
+#define ZVP_EXPORT extern "C" __attribute__((visibility("default")))
+#define ZVP_CALL
+typedef CFStringRef dl_string;
+typedef bool dl_bool;
 
 std::string to_string(CFStringRef s) {
     if (!s)
@@ -36,6 +73,20 @@ std::string to_string(CFStringRef s) {
     CFRelease(s);
     return buf;
 }
+
+void com_init() {}
+
+IDeckLinkIterator* create_iterator() { return CreateDeckLinkIteratorInstance(); }
+#endif
+// ---------- ここまで ----------
+
+struct Device {
+    IDeckLink* deckLink;
+    std::string name;
+};
+
+std::vector<Device> g_devices;
+std::mutex g_lock;
 
 void copy_out(const std::string& s, char* buf, int len) {
     if (buf && len > 0) {
@@ -130,7 +181,7 @@ public:
         }
     }
 
-    HRESULT ScheduledFrameCompleted(IDeckLinkVideoFrame* done, BMDOutputFrameCompletionResult) override {
+    HRESULT ZVP_CALL ScheduledFrameCompleted(IDeckLinkVideoFrame* done, BMDOutputFrameCompletionResult) override {
         std::lock_guard<std::mutex> g(lock);
         for (auto& s : pool)
             if (s.frame == done && s.in_use > 0) {
@@ -140,13 +191,13 @@ public:
         hold_last();
         return S_OK;
     }
-    HRESULT ScheduledPlaybackHasStopped() override { return S_OK; }
-    HRESULT QueryInterface(REFIID, void** ppv) override {
+    HRESULT ZVP_CALL ScheduledPlaybackHasStopped() override { return S_OK; }
+    HRESULT ZVP_CALL QueryInterface(REFIID, void** ppv) override {
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
-    ULONG AddRef() override { return ++refs; }
-    ULONG Release() override {
+    ULONG ZVP_CALL AddRef() override { return ++refs; }
+    ULONG ZVP_CALL Release() override {
         ULONG r = --refs;
         if (r == 0)
             delete this;
@@ -156,11 +207,12 @@ public:
 
 // 機器を探し直す。映像を出せる機器の数を返す (ドライバが無ければ -1)。
 ZVP_EXPORT int zvp_dl_refresh() {
+    com_init();
     std::lock_guard<std::mutex> g(g_lock);
     for (auto& d : g_devices)
         d.deckLink->Release();
     g_devices.clear();
-    IDeckLinkIterator* it = CreateDeckLinkIteratorInstance();
+    IDeckLinkIterator* it = create_iterator();
     if (!it)
         return -1;
     IDeckLink* d = nullptr;
@@ -168,7 +220,7 @@ ZVP_EXPORT int zvp_dl_refresh() {
         IDeckLinkOutput* out = nullptr;
         if (d->QueryInterface(IID_IDeckLinkOutput, (void**)&out) == S_OK) {
             out->Release();
-            CFStringRef name = nullptr;
+            dl_string name = nullptr;
             d->GetDisplayName(&name);
             g_devices.push_back({d, to_string(name)});
         } else {
@@ -189,6 +241,7 @@ ZVP_EXPORT int zvp_dl_device_name(int dev, char* buf, int len) {
 
 // 出力形式を max 個まで modes に書き、書いた数を返す。
 ZVP_EXPORT int zvp_dl_modes(int dev, ModeInfo* modes, int max) {
+    com_init();
     std::lock_guard<std::mutex> g(g_lock);
     IDeckLinkOutput* out = output_of(dev);
     if (!out)
@@ -201,7 +254,7 @@ ZVP_EXPORT int zvp_dl_modes(int dev, ModeInfo* modes, int max) {
             ModeInfo& info = modes[n];
             std::memset(&info, 0, sizeof(info));
             info.mode = m->GetDisplayMode();
-            CFStringRef name = nullptr;
+            dl_string name = nullptr;
             m->GetName(&name);
             copy_out(to_string(name), info.name, sizeof(info.name));
             info.width = (int32_t)m->GetWidth();
@@ -215,7 +268,7 @@ ZVP_EXPORT int zvp_dl_modes(int dev, ModeInfo* modes, int max) {
                               m->GetFieldDominance() == bmdUpperFieldFirst;
             int32_t* ok[2] = {&info.ok8, &info.ok10};
             for (int i = 0; i < 2; i++) {
-                bool supported = false;
+                dl_bool supported = false;
                 BMDDisplayMode actual = 0;
                 out->DoesSupportVideoMode(bmdVideoConnectionUnspecified, info.mode, kFormats[i],
                                           bmdNoVideoOutputConversion, bmdSupportedVideoModeDefault,
@@ -234,6 +287,7 @@ ZVP_EXPORT int zvp_dl_modes(int dev, ModeInfo* modes, int max) {
 
 // 出力を始める。失敗したら nullptr を返し、err に理由を書く。
 ZVP_EXPORT Output* zvp_dl_open(int dev, uint32_t mode, int ten_bit, char* err, int err_len) {
+    com_init();
     std::lock_guard<std::mutex> g(g_lock);
     IDeckLinkOutput* out = output_of(dev);
     if (!out) {
@@ -262,7 +316,9 @@ ZVP_EXPORT Output* zvp_dl_open(int dev, uint32_t mode, int ten_bit, char* err, i
         o->Release();
         return nullptr;
     }
-    out->RowBytesForPixelFormat(fmt, w, &o->row_bytes);
+    int row_bytes = 0;
+    out->RowBytesForPixelFormat(fmt, w, &row_bytes);
+    o->row_bytes = row_bytes;
     if ((size_t)o->row_bytes * h > kLargeFrame)
         o->latency = kLatencyLarge;
     for (int i = 0; i < kPoolSize; i++) {
@@ -290,6 +346,7 @@ ZVP_EXPORT int zvp_dl_row_bytes(Output* o) { return o ? o->row_bytes : 0; }
 
 // 出力のクロック: いま出しているコマの番号 (frame) と、そのコマの中の位置 (0〜1)。成功なら 0。
 ZVP_EXPORT int zvp_dl_clock(Output* o, int64_t* frame, double* phase) {
+    com_init();
     if (!o)
         return -1;
     return o->now(frame, phase) ? 0 : -2;
@@ -307,7 +364,8 @@ ZVP_EXPORT int zvp_dl_stats(Output* o, int64_t* holds, int64_t* resyncs) {
 
 // 予約されていて、まだ出していないコマの数 (確認用)。
 ZVP_EXPORT int zvp_dl_buffered(Output* o) {
-    uint32_t n = 0;
+    com_init();
+    unsigned int n = 0;
     if (!o || o->out->GetBufferedVideoFrameCount(&n) != S_OK)
         return -1;
     return (int)n;
@@ -321,6 +379,7 @@ ZVP_EXPORT int zvp_dl_buffered(Output* o) {
 //            最後の絵が続く (hold_last)。画面のほうが速くて予約が先へ行き過ぎたら 1 枚捨てて合わせる
 // 戻り値: 0 予約した、1 間に合わず捨てた、2 先へ行き過ぎて捨てた、3 空いているコマが無い、負 失敗。
 ZVP_EXPORT int zvp_dl_send(Output* o, const void* data, int64_t tag, int repeat) {
+    com_init();
     if (!o)
         return -1;
     int index = -1;
@@ -386,6 +445,7 @@ ZVP_EXPORT int zvp_dl_send(Output* o, const void* data, int64_t tag, int repeat)
 }
 
 ZVP_EXPORT void zvp_dl_close(Output* o) {
+    com_init();
     if (!o)
         return;
     BMDTimeValue stopped = 0;

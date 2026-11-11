@@ -5,6 +5,6 @@
 | 版 | 場所 | 特長 |
 |---|---|---|
 | ブラウザ版 | [`index.html`](index.html) | ブラウザで開くだけで使える |
-| Python 版 | [`python/`](python/README.md) | PyAV (FFmpeg) でデコードし、MXF・10bit 4:2:2 も開ける。GPU 描画で 120 / 144 / 240fps、フレーム単位のコマ送り、A-B ループ、指定 fps での強制再生。Windows / macOS。macOS では Blackmagic (DeckLink / UltraStudio) の SDI へ拡大中の絵を出せる |
+| Python 版 | [`python/`](python/README.md) | PyAV (FFmpeg) でデコードし、MXF・10bit 4:2:2 も開ける。GPU 描画で 120 / 144 / 240fps、フレーム単位のコマ送り、A-B ループ、指定 fps での強制再生。Windows / macOS。Blackmagic (DeckLink / UltraStudio) の SDI へ拡大中の絵を出せる |
 
 Python 版の使い方・ビルド方法・仕組みは [`python/README.md`](python/README.md) を見てください。

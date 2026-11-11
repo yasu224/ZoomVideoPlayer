@@ -33,9 +33,9 @@ def keep(entry):
 
 import os
 
-# SDI 出力用のライブラリ (build_sdi_mac.sh で作ったもの) があれば一緒に入れる
-SDI_LIB = os.path.join("sdi", "libzvp_decklink.dylib")
-SDI_BINARIES = [(SDI_LIB, "sdi")] if MAC and os.path.exists(SDI_LIB) else []
+# SDI 出力用のライブラリ (build_sdi_mac.sh / build_sdi.bat で作ったもの) があれば一緒に入れる
+SDI_LIB = os.path.join("sdi", "libzvp_decklink.dylib" if MAC else "zvp_decklink.dll")
+SDI_BINARIES = [(SDI_LIB, "sdi")] if os.path.exists(SDI_LIB) else []
 
 a = Analysis(
     ["zoom_player.py"],
