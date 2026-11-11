@@ -17,12 +17,44 @@
 #endif
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <smmintrin.h>           // SSE4.1 (_mm_stream_load_si128)
+#define ZVP_X86 1
+#endif
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace {
+
+// 1 コマ分を写す。送る絵は GPU の読み出し用バッファを開いたもの (Windows の Intel GPU などでは
+// CPU のキャッシュが効かないメモリ) なので、普通の memcpy だと 4K 10bit (22 MB) に 11〜18 ms かかり、
+// 画面の描画まで遅らせていた。x86 ではキャッシュを通さない読み書き (SSE4.1 の streaming load と
+// non-temporal store) で写す。どちらかが 16 バイト境界にないとき、x86 以外 (Apple シリコン) は memcpy
+void copy_frame(void* dst, const void* src, size_t n) {
+#ifdef ZVP_X86
+    if (((uintptr_t)dst & 15) == 0 && ((uintptr_t)src & 15) == 0) {
+        auto* d = (__m128i*)dst;
+        auto* s = (__m128i*)const_cast<void*>(src);
+        size_t blocks = n / 64;
+        for (size_t i = 0; i < blocks; i++, d += 4, s += 4) {
+            __m128i a = _mm_stream_load_si128(s), b = _mm_stream_load_si128(s + 1);
+            __m128i c = _mm_stream_load_si128(s + 2), e = _mm_stream_load_si128(s + 3);
+            _mm_stream_si128(d, a);
+            _mm_stream_si128(d + 1, b);
+            _mm_stream_si128(d + 2, c);
+            _mm_stream_si128(d + 3, e);
+        }
+        _mm_sfence();
+        size_t done = blocks * 64;
+        std::memcpy((char*)dst + done, (const char*)src + done, n - done);
+        return;
+    }
+#endif
+    std::memcpy(dst, src, n);
+}
 
 // ---------- OS ごとの違い ----------
 #ifdef _WIN32
@@ -269,8 +301,9 @@ ZVP_EXPORT int zvp_dl_modes(int dev, ModeInfo* modes, int max) {
             int32_t* ok[2] = {&info.ok8, &info.ok10};
             for (int i = 0; i < 2; i++) {
                 dl_bool supported = false;
-                BMDDisplayMode actual = 0;
-                out->DoesSupportVideoMode(bmdVideoConnectionUnspecified, info.mode, kFormats[i],
+                // Windows の SDK では BMDDisplayMode が列挙型なので、数値から明示的に変換する
+                BMDDisplayMode actual = static_cast<BMDDisplayMode>(0);
+                out->DoesSupportVideoMode(bmdVideoConnectionUnspecified, static_cast<BMDDisplayMode>(info.mode), kFormats[i],
                                           bmdNoVideoOutputConversion, bmdSupportedVideoModeDefault,
                                           &actual, &supported);
                 *ok[i] = supported ? 1 : 0;
@@ -295,7 +328,7 @@ ZVP_EXPORT Output* zvp_dl_open(int dev, uint32_t mode, int ten_bit, char* err, i
         return nullptr;
     }
     IDeckLinkDisplayMode* dm = nullptr;
-    if (out->GetDisplayMode(mode, &dm) != S_OK) {
+    if (out->GetDisplayMode(static_cast<BMDDisplayMode>(mode), &dm) != S_OK) {
         out->Release();
         copy_out("この出力形式は使えません", err, err_len);
         return nullptr;
@@ -307,7 +340,7 @@ ZVP_EXPORT Output* zvp_dl_open(int dev, uint32_t mode, int ten_bit, char* err, i
     o->out = out;
     o->height = h;
     BMDPixelFormat fmt = kFormats[ten_bit ? 1 : 0];
-    HRESULT r = out->EnableVideoOutput(mode, bmdVideoOutputFlagDefault);
+    HRESULT r = out->EnableVideoOutput(static_cast<BMDDisplayMode>(mode), bmdVideoOutputFlagDefault);
     if (r != S_OK) {
         copy_out(r == E_ACCESSDENIED ? "ほかのアプリが出力を使っています" : "出力を始められませんでした",
                  err, err_len);
@@ -408,7 +441,7 @@ ZVP_EXPORT int zvp_dl_send(Output* o, const void* data, int64_t tag, int repeat)
         void* bytes = nullptr;
         if (buf->StartAccess(bmdBufferAccessWrite) == S_OK) {
             if (buf->GetBytes(&bytes) == S_OK) {
-                std::memcpy(bytes, data, (size_t)o->row_bytes * o->height);   // 4K 10bit で 2.4 ms
+                copy_frame(bytes, data, (size_t)o->row_bytes * o->height);
                 result = 0;
             }
             buf->EndAccess(bmdBufferAccessWrite);
