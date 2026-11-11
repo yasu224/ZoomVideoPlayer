@@ -279,11 +279,15 @@ def attach_shared_memory(name):
     登録を外すと画面側の登録まで消え、画面側が片付けるときに KeyError が出る。
     そのため、開くときに登録そのものをしない (Python 3.13 の track=False と同じ)。
     """
+    import os
     import sys
-    from multiprocessing import resource_tracker, shared_memory
+    from multiprocessing import shared_memory
 
+    if os.name != "posix":                 # Windows は後始末の登録をしない (OS が片付ける)
+        return shared_memory.SharedMemory(name=name)
     if sys.version_info >= (3, 13):
         return shared_memory.SharedMemory(name=name, track=False)
+    from multiprocessing import resource_tracker
     register = resource_tracker.register
 
     def register_except_shm(res_name, rtype):

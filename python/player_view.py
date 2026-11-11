@@ -17,6 +17,7 @@ MAX_ZOOM = 64          # 全体表示に対する最大倍率
 MINI_W = 220           # ミニマップの幅
 SDI_COLLECT_MS = 10    # SDI 用の読み出しを受け取るまでの待ち (GPU が描き終えている頃)
 SDI_PBOS = 4           # SDI 用の読み出しバッファの数
+SDI_CODES_UNIT = 4     # v210 の 2 回目で、1 回目の結果を付けるテクスチャユニット (0〜2 は Y/U/V、3 は作るとき用)
 
 
 def gpu_wanted():
@@ -361,7 +362,9 @@ uniform vec3 offset;
 uniform float scale;
 uniform vec2 out_size;     // 出力の幅・高さ (画素)
 uniform vec4 xform;        // 出力の画素 → 画像の uv: uv = (p - xform.xy) / xform.zw
-uniform float ten_bit;
+uniform float stage;       // 0: 2vuy を詰める / 1: 2 画素ごとの 10bit のコード値 / 2: 1 の結果を v210 に詰める
+uniform sampler2D tex_codes;   // stage 2 で読む、stage 1 の結果 (Y0, Y1, Cb, Cr のコード値 / 1023)
+uniform vec2 codes_size;
 
 vec3 yuv_at(float x, float y) {          // 出力の画素 (x 列目, 上から y 行目) の BT.709 の Y, Cb, Cr
     vec2 uv = (vec2(x + 0.5, y + 0.5) - xform.xy) / xform.zw;
@@ -384,29 +387,33 @@ vec4 word(float c0, float c1, float c2) {   // 10bit を 3 つ詰めた 32bit (�
     return vec4(b0, b1, b2, b3) / 255.0;
 }
 
+vec4 pair_at(float x, float y) {          // stage 1 の結果: x 番目の 2 画素の (Y0, Y1, Cb, Cr) のコード値
+    return floor(texture2D(tex_codes, vec2((x + 0.5) / codes_size.x, (y + 0.5) / codes_size.y)) * 1023.0 + 0.5);
+}
+
 void main() {
     float i = floor(gl_FragCoord.x);
     float y = floor(gl_FragCoord.y);
-    if (ten_bit < 0.5) {                 // 2vuy: Cb Y0 Cr Y1 (2 画素)
+    if (stage > 0.5 && stage < 1.5) {    // 2 画素 (2i, 2i+1) の Y0, Y1 と、2 画素の平均の Cb, Cr を 10bit で書く
+        vec3 p0 = yuv_at(2.0 * i, y), p1 = yuv_at(2.0 * i + 1.0, y);
+        vec2 c = (p0.yz + p1.yz) * 0.5;
+        gl_FragColor = vec4(code_y(p0.x, 4.0), code_y(p1.x, 4.0), code_c(c.x, 4.0), code_c(c.y, 4.0)) / 1023.0;
+        return;
+    }
+    if (stage < 0.5) {                   // 2vuy: Cb Y0 Cr Y1 (2 画素)
         vec3 p0 = yuv_at(2.0 * i, y), p1 = yuv_at(2.0 * i + 1.0, y);
         vec2 c = (p0.yz + p1.yz) * 0.5;
         gl_FragColor = vec4(code_c(c.x, 1.0), code_y(p0.x, 1.0), code_c(c.y, 1.0), code_y(p1.x, 1.0)) / 255.0;
         return;
     }
-    // v210: 6 画素を 4 語 (16 バイト) に詰める。語ごとに使う画素だけ計算するよう分岐すると、
-    // 隣の画素と別の道を通るので GPU は全部の道をたどり、かえって 3 割遅くなる。6 画素全部を計算する
+    // v210 (stage 2): 6 画素 (3 組) を 4 語 (16 バイト) に詰める。色の変換と丸めは stage 1 で 2 画素ごとに
+    // 1 回だけ済ませてあるので、ここは 3 組を読んで詰めるだけ (以前は 1 語ごとに 6 画素とも変換していて、
+    // 4K では GPU が 1 コマ 12 ms かかり画面の描画まで遅れていた)
     float g = floor(i / 4.0);
     float w = i - g * 4.0;
-    float x0 = g * 6.0;
-    vec3 p[6];
-    for (int k = 0; k < 6; k++)
-        p[k] = yuv_at(x0 + float(k), y);
-    float Y0 = code_y(p[0].x, 4.0), Y1 = code_y(p[1].x, 4.0), Y2 = code_y(p[2].x, 4.0);
-    float Y3 = code_y(p[3].x, 4.0), Y4 = code_y(p[4].x, 4.0), Y5 = code_y(p[5].x, 4.0);
-    vec2 c0 = (p[0].yz + p[1].yz) * 0.5, c1 = (p[2].yz + p[3].yz) * 0.5, c2 = (p[4].yz + p[5].yz) * 0.5;
-    float Cb0 = code_c(c0.x, 4.0), Cr0 = code_c(c0.y, 4.0);
-    float Cb1 = code_c(c1.x, 4.0), Cr1 = code_c(c1.y, 4.0);
-    float Cb2 = code_c(c2.x, 4.0), Cr2 = code_c(c2.y, 4.0);
+    vec4 q0 = pair_at(g * 3.0, y), q1 = pair_at(g * 3.0 + 1.0, y), q2 = pair_at(g * 3.0 + 2.0, y);
+    float Y0 = q0.x, Y1 = q0.y, Y2 = q1.x, Y3 = q1.y, Y4 = q2.x, Y5 = q2.y;
+    float Cb0 = q0.z, Cr0 = q0.w, Cb1 = q1.z, Cr1 = q1.w, Cb2 = q2.z, Cr2 = q2.w;
     if (w < 0.5)      gl_FragColor = word(Cb0, Y0, Cr0);
     else if (w < 1.5) gl_FragColor = word(Y1, Cb1, Y2);
     else if (w < 2.5) gl_FragColor = word(Cr1, Y3, Cb2);
@@ -492,7 +499,12 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         self.sdi = None             # SDI 出力 (player_sdi.SdiOutput)。あれば拡大中の絵を描いて送る
         self._sdi_key = None        # 最後に送った絵 (コマと拡大の状態)。変わらなければ送り直さない
         self._sdi_target = None     # (フレームバッファ, テクスチャ, 幅, 高さ, [読み出し用バッファ SDI_PBOS 個])
-        self._sdi_pending = None    # 読み出しを頼んで、まだ受け取っていない (バッファ, 出力, 大きさ, 印, 回数)
+        # 読み出しを頼んで、まだ受け取っていないもの。古い順に [バッファ, 出力, 大きさ, 印, 回数, 終わりの印]。
+        # 終わりの印 (GL の fence) が立つまでは開かない (開くと GPU が読み出しを終えるまで画面側が止まるため)
+        self._sdi_pending = []
+        self._sdi_poll = False      # 読み出しの終わりを確かめ直す予定があるか
+        self._sdi_codes = None      # v210 の 1 回目の書く先 (フレームバッファ, テクスチャ, 幅, 高さ)
+        self._sdi_drawn = None      # 描いて、まだ読み出しを頼んでいない絵 (次の書き換えで頼む)
         self._sdi_mapped = set()    # 開いて送るスレッドへ渡している読み出し用バッファ
         self._sdi_unmap = []        # 送り終えて閉じてよいバッファ (送るスレッドが足す)
         self._sdi_retry = False     # 描けなかった変化を後で描き直す予定があるか
@@ -528,7 +540,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
                     shaders.compileShader(SDI_SHADER, GL.GL_FRAGMENT_SHADER))
                 self.sdi_loc = {key: GL.glGetUniformLocation(self.sdi_program, key)
                                 for key in ("tex_y", "tex_u", "tex_v", "yuv_to_rgb", "offset", "scale",
-                                            "out_size", "xform", "ten_bit")}
+                                            "out_size", "xform", "stage", "tex_codes", "codes_size")}
                 self.sdi_attr_pos = GL.glGetAttribLocation(self.sdi_program, "pos")
             except Exception as e:      # SDI 出力が使えないだけで、画面の表示は続ける
                 print(f"SDI 出力用のシェーダーを作れません: {e}")
@@ -727,10 +739,13 @@ class GpuWindow(ViewBase, QOpenGLWindow):
 
         画面と同じテクスチャ (いま表の組) を使うので、画面に出したコマと同じコマが出る。
         いつ描くかは player_sdi の説明のとおり (順番に並べるときは新しいコマごと、それ以外は機器のコマごと)。
-        読み出しは GPU のバッファへ頼むだけで、受け取るのは次の書き換えか少し後 (_collect_sdi)。
+        読み出し (4K では GPU で 5 ms ほど) は描いたコマでは頼まず、次の書き換えで頼む (_read_sdi)。
+        描くのと同じ書き換えの間に読み出しまで行うと、4K では GPU の仕事が 1 回分 (120Hz で 8.3 ms) を
+        超えて画面の書き換えを取りこぼし、SDI へ送るコマも減っていた。受け取るのはさらにその後 (_collect_sdi)。
         """
         if self.sdi_program is None:
             return
+        self._read_sdi()
         self._collect_sdi()
         self._unmap_sdi()
         out = self.sdi
@@ -752,15 +767,15 @@ class GpuWindow(ViewBase, QOpenGLWindow):
                 QTimer.singleShot(max(1, math.ceil(out.wait_time() * 1000)), self._sdi_again)
             return
         fb, _, TW, H, pbos = self._sdi_target_for(out.texels, out.height)
-        busy = self._sdi_mapped | ({self._sdi_pending[0]} if self._sdi_pending else set())
+        busy = self._sdi_mapped | {item[0] for item in self._sdi_pending}
+        if self._sdi_drawn is not None:
+            busy.add(self._sdi_drawn[0])
         pbo = next((b for b in pbos if b not in busy), None)
         if pbo is None:                  # 送るのが追いつかず、読み出し用バッファが空いていない
             return
         GL = self.GL
         so, ox, oy = view_transform(self.width(), self.height(), self.s, self.tx, self.ty,
                                     self.picture.w, self.picture.h, out.width, H)
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fb)
-        GL.glViewport(0, 0, TW, H)
         GL.glUseProgram(self.sdi_program)
         loc = self.sdi_loc
         GL.glUniformMatrix3fv(loc["yuv_to_rgb"], 1, GL.GL_FALSE, matrix)
@@ -768,18 +783,35 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glUniform1f(loc["scale"], 1.0 if bits == 8 else 65535 / ((1 << bits) - 1))
         for unit, name in enumerate(("tex_y", "tex_u", "tex_v")):
             GL.glUniform1i(loc[name], unit)
+        GL.glUniform1i(loc["tex_codes"], SDI_CODES_UNIT)
         GL.glUniform2f(loc["out_size"], out.width, H)
         GL.glUniform4f(loc["xform"], ox, oy, self.picture.w * so, self.picture.h * so)
-        GL.glUniform1f(loc["ten_bit"], 1.0 if out.ten_bit else 0.0)
         pos = np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32)
         GL.glEnableVertexAttribArray(self.sdi_attr_pos)
         GL.glVertexAttribPointer(self.sdi_attr_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, pos)
-        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        if out.ten_bit:
+            # 1 回目: 2 画素ごとに色を変換してコード値を書く。2 回目: それを v210 に詰める
+            cfb, ctex, CW = self._sdi_codes_for(TW * 3 // 4, H)     # 1 語 = 1.5 画素、2 画素で 1 組
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, cfb)
+            GL.glViewport(0, 0, CW, H)
+            GL.glUniform1f(loc["stage"], 1.0)
+            GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fb)
+            GL.glViewport(0, 0, TW, H)
+            GL.glActiveTexture(GL.GL_TEXTURE0 + SDI_CODES_UNIT)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, ctex)
+            GL.glUniform2f(loc["codes_size"], CW, H)
+            GL.glUniform1f(loc["stage"], 2.0)
+            GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+        else:
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fb)
+            GL.glViewport(0, 0, TW, H)
+            GL.glUniform1f(loc["stage"], 0.0)
+            GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glDisableVertexAttribArray(self.sdi_attr_pos)
-        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 4)
-        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
-        GL.glReadPixels(0, 0, TW, H, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
-        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+        GL.glFlush()                     # 描く命令は今の書き換えのうちに GPU へ送る
         # 画面へ描く状態に戻す
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
         dpr = self.devicePixelRatioF()
@@ -787,8 +819,27 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         out.rendered()
         self._sdi_key = key
         tag, repeat = (SEQUENCE, sequence[0]) if sequence else (out.rendered_frame, 1)
-        self._sdi_pending = (pbo, out, TW * 4 * H, tag, repeat)
-        QTimer.singleShot(SDI_COLLECT_MS, self._collect_sdi_later)
+        self._sdi_drawn = [pbo, out, TW * 4 * H, tag, repeat, fb, TW, H]
+        # 書き換えが来ないとき (停止中) は、少し後に読み出しを頼む
+        self._poll_sdi_later(SDI_COLLECT_MS)
+
+    def _read_sdi(self):
+        """前に描いた SDI の絵の読み出しを頼む (GPU のバッファへ。待たない)。OpenGL の文脈が今のときに呼ぶ。"""
+        drawn, self._sdi_drawn = self._sdi_drawn, None
+        if drawn is None:
+            return
+        pbo, out, size, tag, repeat, fb, TW, H = drawn
+        if out is not self.sdi:
+            return
+        GL = self.GL
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, fb)
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 4)
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
+        GL.glReadPixels(0, 0, TW, H, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
+        GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.defaultFramebufferObject())
+        self._sdi_pending.append([pbo, out, size, tag, repeat, self._fence()])
+        self._poll_sdi_later(2)
 
     def _sdi_target_for(self, width, height):
         """SDI 用に描く先 (width × height の RGBA8 テクスチャを付けたフレームバッファ) と読み出し用バッファ。
@@ -823,14 +874,68 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         self._sdi_target = (fb, tex, width, height, pbos)
         return self._sdi_target
 
-    def _collect_sdi(self):
-        """頼んでおいた読み出しを受け取り、SDI 出力へ渡す。OpenGL の文脈が今のときに呼ぶ。"""
-        if self._sdi_pending is None:
-            return
-        pbo, out, size, tag, repeat = self._sdi_pending
-        self._sdi_pending = None
-        if out is not self.sdi:
-            return
+    def _sdi_codes_for(self, width, height):
+        """v210 の 1 回目 (2 画素ごとのコード値) を書く先。16bit の RGBA テクスチャを付けたフレームバッファ。"""
+        target = self._sdi_codes
+        if target is not None and target[2:4] == (width, height):
+            return target[0], target[1], width
+        GL = self.GL
+        if target is not None:
+            GL.glDeleteFramebuffers(1, [target[0]])
+            GL.glDeleteTextures([target[1]])
+        tex = GL.glGenTextures(1)
+        GL.glActiveTexture(GL.GL_TEXTURE0 + SDI_CODES_UNIT)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        # 10bit のコード値を 4 つ (Y0, Y1, Cb, Cr) 持つ (8bit では足りない)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA16, width, height, 0, GL.GL_RGBA, GL.GL_UNSIGNED_SHORT, None)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        fb = GL.glGenFramebuffers(1)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fb)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, tex, 0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        self._sdi_codes = (fb, tex, width, height)
+        return fb, tex, width
+
+    def _fence(self):
+        """ここまでの GPU の命令が終わったら立つ印。使えない環境では None (開くときに待つ)。"""
+        GL = self.GL
+        try:
+            fence = GL.glFenceSync(GL.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+        except Exception:                # OpenGL 3.2 / ARB_sync が無い
+            return None
+        GL.glFlush()                     # 命令を GPU へ送り出す (送らないと印がいつまでも立たない)
+        return fence
+
+    def _fence_done(self, fence, wait=False):
+        if fence is None:
+            return True
+        GL = self.GL
+        status = GL.glClientWaitSync(fence, 0, 0 if not wait else 1_000_000_000)
+        return status in (GL.GL_ALREADY_SIGNALED, GL.GL_CONDITION_SATISFIED)
+
+    def _collect_sdi(self, wait=False):
+        """読み出しが終わったものを古い順に受け取り、SDI 出力へ渡す。OpenGL の文脈が今のときに呼ぶ。
+
+        まだ終わっていないものは開かずに残す (開くと終わるまで画面側が止まり、4K では 80 ms も止まって
+        画面のコマが遅れ、SDI へ送るコマも減っていた)。wait なら終わるまで待つ。
+        """
+        GL = self.GL
+        while self._sdi_pending:
+            pbo, out, size, tag, repeat, fence = self._sdi_pending[0]
+            if out is self.sdi and not self._fence_done(fence, wait):
+                break                    # 順番を守るため、これより新しいものも待つ
+            self._sdi_pending.pop(0)
+            if fence is not None:
+                GL.glDeleteSync(fence)
+            if out is self.sdi:
+                self._submit_sdi(pbo, out, size, tag, repeat)
+
+    def _submit_sdi(self, pbo, out, size, tag, repeat):
         GL = self.GL
         GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
         ptr = GL.glMapBuffer(GL.GL_PIXEL_PACK_BUFFER, GL.GL_READ_ONLY)
@@ -856,13 +961,23 @@ class GpuWindow(ViewBase, QOpenGLWindow):
             self._sdi_mapped.discard(pbo)
         GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
 
+    def _poll_sdi_later(self, ms):
+        if not self._sdi_poll:
+            self._sdi_poll = True
+            QTimer.singleShot(ms, self._collect_sdi_later)
+
     def _collect_sdi_later(self):
-        """書き換えが来ないとき (停止中) にも、読み出しを受け取り、送り終えたバッファを閉じる。"""
-        if (self._sdi_pending is not None or self._sdi_unmap) and self.initialized:
+        """書き換えを待たずに、読み出しを受け取り、送り終えたバッファを閉じる。まだ終わっていない
+        読み出しがあれば、少し後に確かめ直す。"""
+        self._sdi_poll = False
+        if (self._sdi_drawn or self._sdi_pending or self._sdi_unmap) and self.initialized:
             self.makeCurrent()
+            self._read_sdi()
             self._collect_sdi()
             self._unmap_sdi()
             self.doneCurrent()
+        if self._sdi_pending:
+            self._poll_sdi_later(2)
 
     def _sdi_again(self):
         self._sdi_retry = False
@@ -872,8 +987,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
     def set_sdi(self, output):
         """SDI 出力を付け替える (None で止める)。古い出力は呼んだ側が閉じる。"""
         self.sdi = output
-        self._sdi_key = None
-        self._sdi_pending = None
+        self._sdi_key = None              # 古い出力の読み出しは、受け取るときに捨てる
         self.update()
         # 止めた出力が送り終えたバッファを閉じる (呼んだ側が古い出力を閉じた後)
         QTimer.singleShot(50, self._collect_sdi_later)

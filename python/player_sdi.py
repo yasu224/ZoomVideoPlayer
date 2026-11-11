@@ -1,8 +1,8 @@
 """Blackmagic DeckLink / UltraStudio への SDI 出力。
 
 画面に出している拡大中の範囲を、出力形式の解像度で描き直して送る (描くのは player_view.GpuWindow)。
-機器とのやり取りは sdi/libzvp_decklink.dylib (build_sdi_mac.sh でビルド) を ctypes で呼ぶ。
-今は macOS だけに対応している。
+機器とのやり取りは sdi/ の小さなライブラリを ctypes で呼ぶ。macOS は libzvp_decklink.dylib
+(build_sdi_mac.sh でビルド)、Windows は zvp_decklink.dll (build_sdi.bat でビルド)。
 
 出力は 8bit YUV 4:2:2 (2vuy、UYVY の並び) か 10bit YUV 4:2:2 (v210)、色は BT.709 の映像範囲。
 
@@ -25,7 +25,7 @@ import threading
 
 import numpy as np
 
-LIB_NAME = "libzvp_decklink.dylib"
+LIB_NAMES = {"darwin": ("libzvp_decklink.dylib", "build_sdi_mac.sh"), "win32": ("zvp_decklink.dll", "build_sdi.bat")}
 SEQUENCE = -2         # 送るときの印: 前に予約した絵のすぐ後ろへ順番に並べる (動画と出力の fps が整数倍のとき)
 MAX_PENDING = 4       # 送る前の絵をいくつまで貯めるか (超えたら古いものを捨てる)
 
@@ -61,12 +61,12 @@ class SdiMode:
         return f"{self.name} ({'10bit' if self.ten_bit else '8bit'})"
 
 
-def _lib_paths():
+def _lib_paths(name):
     here = os.path.dirname(os.path.abspath(__file__))
-    paths = [os.path.join(here, "sdi", LIB_NAME)]
+    paths = [os.path.join(here, "sdi", name)]
     base = getattr(sys, "_MEIPASS", None)          # PyInstaller でまとめたとき
     if base:
-        paths.insert(0, os.path.join(base, "sdi", LIB_NAME))
+        paths.insert(0, os.path.join(base, "sdi", name))
     return paths
 
 
@@ -79,12 +79,13 @@ def load_library():
     global _lib, _lib_error
     if _lib is not None or _lib_error is not None:
         return _lib
-    if sys.platform != "darwin":
-        _lib_error = "SDI 出力は今は macOS だけに対応しています"
+    if sys.platform not in LIB_NAMES:
+        _lib_error = "SDI 出力は macOS と Windows だけに対応しています"
         return None
-    path = next((p for p in _lib_paths() if os.path.exists(p)), None)
+    name, script = LIB_NAMES[sys.platform]
+    path = next((p for p in _lib_paths(name) if os.path.exists(p)), None)
     if path is None:
-        _lib_error = "SDI 出力用のライブラリがありません (build_sdi_mac.sh でビルドしてください)"
+        _lib_error = f"SDI 出力用のライブラリがありません ({script} でビルドしてください)"
         return None
     try:
         lib = ctypes.CDLL(path)
