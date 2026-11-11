@@ -275,18 +275,26 @@ def attach_shared_memory(name):
 
     macOS / Linux では、開いただけの子プロセスも後始末の対象として登録され、終了時に
     「片付け忘れ」の警告が出たり、先に消されたりする。その登録をしないようにする。
+    子プロセスは画面側と同じ後始末係 (resource_tracker) を共有しているので、開いたあとで
+    登録を外すと画面側の登録まで消え、画面側が片付けるときに KeyError が出る。
+    そのため、開くときに登録そのものをしない (Python 3.13 の track=False と同じ)。
     """
-    import os
     import sys
-    from multiprocessing import shared_memory
+    from multiprocessing import resource_tracker, shared_memory
 
     if sys.version_info >= (3, 13):
         return shared_memory.SharedMemory(name=name, track=False)
-    shm = shared_memory.SharedMemory(name=name)
-    if os.name == "posix":
-        from multiprocessing import resource_tracker
-        resource_tracker.unregister(shm._name, "shared_memory")
-    return shm
+    register = resource_tracker.register
+
+    def register_except_shm(res_name, rtype):
+        if rtype != "shared_memory":
+            register(res_name, rtype)
+
+    resource_tracker.register = register_except_shm
+    try:
+        return shared_memory.SharedMemory(name=name)
+    finally:
+        resource_tracker.register = register
 
 
 def decode_worker(path, fmt, shm_name, slots, cmd_q, ready_q, free_q, clock_values, decoded, sent, started):

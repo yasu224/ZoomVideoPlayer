@@ -6,6 +6,8 @@ __pycache__/
 # PyInstaller の出力 (build.bat / build_mac.sh で作り直せる)
 python/build/
 python/dist/
+# SDI 出力用のライブラリ (build_sdi_mac.sh で作り直せる。DeckLink SDK が要る)
+python/sdi/*.dylib
 
 # OS
 .DS_Store
