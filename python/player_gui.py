@@ -311,7 +311,14 @@ class MainWindow(LiveMixin, QMainWindow):
         self.rec_btn = self._button("● 録画", self.toggle_recording, "入力の映像をファイルに録画する (R)")
         self.rec_btn.setCheckable(True)
         self.rec_btn.setVisible(False)
-        for w in (self.play_btn, self.prev_btn, self.next_btn, self.rec_btn):
+        self.wb_check = QCheckBox("自動WB")
+        self.wb_check.setFocusPolicy(Qt.NoFocus)
+        self.wb_check.setToolTip("入力の映像の白の崩れ (青っぽい・黄色っぽいなど) を自動で直して表示する。\n"
+                                 "画面と SDI 出力に効く。録画は入力のまま (補正しない)。GPU 描画のときだけ使える")
+        self.wb_check.setVisible(False)
+        self.wb_check.setChecked(self.settings().value("live/auto_wb", False, type=bool))
+        self.wb_check.toggled.connect(self.wb_toggled)
+        for w in (self.play_btn, self.prev_btn, self.next_btn, self.rec_btn, self.wb_check):
             row1.addWidget(w)
         row1.addWidget(self.slider, 1)
         row1.addWidget(self.time_label)
@@ -379,6 +386,8 @@ class MainWindow(LiveMixin, QMainWindow):
             w.setEnabled(on and not live)
         self.clear_btn.setEnabled(on and not live and (self.point_a is not None or self.point_b is not None))
         self.rec_btn.setVisible(live)
+        self.wb_check.setVisible(live)
+        self.wb_check.setEnabled(isinstance(self.view, GpuWindow))
 
     def show_help(self):
         QMessageBox.information(self, "操作方法", HELP_TEXT)

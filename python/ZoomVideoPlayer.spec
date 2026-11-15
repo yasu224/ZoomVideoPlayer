@@ -74,6 +74,9 @@ if MAC:
             # 映像入力でカメラ (HDMI / SDI のキャプチャー機器を含む) を使う。書いていないと、
             # カメラを開いたところで macOS がアプリを止める
             "NSCameraUsageDescription": "カメラやキャプチャー機器の映像を表示・録画するために使います。",
+            # macOS のリアクション (手のジェスチャーで風船などを映像に重ねる) を既定で切る。入ったままだと
+            # 手の検出がアプリの中で毎コマ動いて CPU を使い、映像にエフェクトが重なることもある
+            "NSCameraReactionEffectGesturesEnabledDefault": False,
             # Finder で動画を右クリック →「このアプリケーションで開く」に出す
             "CFBundleDocumentTypes": [{
                 "CFBundleTypeName": "Video",

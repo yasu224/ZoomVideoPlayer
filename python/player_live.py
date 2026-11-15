@@ -4,23 +4,24 @@
 画面が表示中の 1 枚 (held) と最新の 1 枚 (latest) には書かない。画面側は書き換えのたびに latest() を呼び、
 新しいコマがあれば表示する (古いコマは自然に手放される)。
 - SDI 入力: DeckLink のライブラリ (sdi/) が受け取り、P210 (10bit 4:2:2) にほどいてバッファへ書く
-- カメラ: FFmpeg (macOS は AVFoundation、Windows は DirectShow) から NV12 で受け取る (裏のスレッド)
+- カメラ: FFmpeg (macOS は AVFoundation、Windows は DirectShow) から NV12 で受け取る (別プロセス: player_capture)
 どちらも画面 (GPU) がそのまま読める形式で、録画 (HEVC) にもそのまま渡せる。
 """
 import ctypes
 import queue
-import sys
 import threading
 import time
 from fractions import Fraction
 
 import numpy as np
 
+import player_capture as capture
 import player_sdi
-from player_core import even_size, fill_frame, frame_size, gpu_format, write_frame
+from player_capture import camera_names
+from player_core import attach_shared_memory, fill_frame, frame_size, unlink_shared_memory
 from player_frames import Picture
 
-BUFFERS = 4           # 入力ごとのバッファの数 (表示中・最新・書き込み中 + 予備)
+BUFFERS = capture.BUFFERS    # 入力ごとのバッファの数 (表示中・最新・書き込み中 + 予備)
 
 
 class LiveDevice:
@@ -177,86 +178,13 @@ class SdiInput:
             self.handle = None
 
 
-# ---------- カメラ (FFmpeg) ----------
-def _camera_format():
-    return {"darwin": "avfoundation", "win32": "dshow"}.get(sys.platform)
-
-
-def _ffmpeg_log(url, fmt, options):
-    """FFmpeg に開かせて、出たログの文字を返す (機器の一覧や、使える形式の一覧を読むため)。"""
-    import av
-    import av.logging
-    level = av.logging.get_level()
-    av.logging.set_level(av.logging.INFO)
-    lines = []
-    try:
-        with av.logging.Capture(True) as captured:
-            try:
-                av.open(url, format=fmt, options=options, timeout=5).close()
-            except Exception:
-                pass
-        lines = [msg.rstrip() for _, _, msg in captured]
-    finally:
-        av.logging.set_level(level)
-    return lines
-
-
-def camera_names():
-    """カメラの (番号, 名前) の一覧。"""
-    fmt = _camera_format()
-    if fmt is None:
-        return []
-    import av
-    if fmt not in av.formats_available:
-        return []
-    url = "" if fmt == "avfoundation" else "dummy"
-    lines = _ffmpeg_log(url, fmt, {"list_devices": "true"})
-    names, video = [], False
-    for line in lines:
-        if "video devices" in line.lower():
-            video = True
-            continue
-        if "audio devices" in line.lower():
-            video = False
-            continue
-        if not video:
-            continue
-        if fmt == "avfoundation" and line.startswith("[") and "]" in line:
-            names.append(line.split("]", 1)[1].strip())
-        elif fmt == "dshow" and line.startswith('"') and line.count('"') >= 2:
-            names.append(line.split('"')[1])
-    return list(enumerate(names))
-
-
-def camera_modes(device):
-    """カメラの使える (幅, 高さ, fps) の一覧 (macOS)。わざと無い fps を指定して、一覧のログを出させる。"""
-    if _camera_format() != "avfoundation":
-        return []
-    modes = []
-    for line in _ffmpeg_log(f"{device.index}:none", "avfoundation", {"framerate": "1234"}):
-        if "@[" not in line:
-            continue
-        try:
-            size, rate = line.strip().split("@[")
-            w, h = size.split("x")
-            fps = float(rate.split()[0])
-            modes.append((int(w), int(h), fps))
-        except ValueError:
-            pass
-    return sorted(set(modes))
-
-
-def best_mode(modes):
-    """1080p の 60fps 前後を優先し、無ければいちばん大きく、fps の高いもの。"""
-    if not modes:
-        return None
-    full_hd = [m for m in modes if (m[0], m[1]) == (1920, 1080) and m[2] <= 61]
-    pool = full_hd or [m for m in modes if m[2] <= 61] or modes
-    return max(pool, key=lambda m: (m[0] * m[1], m[2]))
-
-
+# ---------- カメラ (FFmpeg、別プロセスで読む: player_capture) ----------
 class CameraInput:
-    """カメラ。裏のスレッドで FFmpeg から読み、NV12 (使えなければ GPU 用の形式) でバッファへ書く。"""
+    """カメラ。別プロセス (player_capture.camera_worker) が読んで共有メモリのバッファへ書いたコマを受け取る。
+
+    macOS では映像が届いていないとカメラの読み取りが止められないので、閉じるときに止まらなければ
+    プロセスごと終わらせる。
+    """
 
     def __init__(self, device):
         self.device = device
@@ -266,105 +194,99 @@ class CameraInput:
         self.fps = 0.0
         self.mode_name = ""
         self.error = ""
-        self.frames = 0
-        self.dropped = 0
-        self.last_frame_at = 0.0
+        self.problem = ""             # 信号なしのときに FFmpeg が返した失敗 (確かめるとき用)
+        self.effects = []             # 入っている macOS のビデオエフェクト (映像が加工され、CPU も使う)
         self.last_no = 0
-        self._lock = threading.Lock()
-        self._bufs = []
-        self._held = self._latest = -1
-        self._latest_no = 0
-        self._latest_t = 0.0
-        self._stop = threading.Event()
-        self._thread = None
+        self._serial = 0
+        self._shm_names = []          # 知らされた共有メモリの名前 (プロセスごと終わらせたときに片付ける)
+        self._shm = None
+        self._views = []
+        self._proc = None
 
     def open(self):
-        self._thread = threading.Thread(target=self._run, name="camera", daemon=True)
-        self._thread.start()
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        self._state = ctx.Array("d", [-1, 0, -1, 0, 0, 0, 0, 0, 0][:capture.STATE_SIZE])
+        self._messages = ctx.Queue()
+        self._stop = ctx.Event()
+        self._proc = ctx.Process(target=capture.camera_worker, daemon=True,
+                                 args=(self.device.index, self.name, self._state, self._messages, self._stop))
+        self._proc.start()
         return self
 
-    def _open_container(self):
-        import av
-        fmt = _camera_format()
-        options = {"pixel_format": "nv12"} if fmt == "avfoundation" else {}
-        mode = best_mode(camera_modes(self.device))
-        if mode:
-            options["video_size"] = f"{mode[0]}x{mode[1]}"
-            options["framerate"] = f"{mode[2]:.6f}".rstrip("0").rstrip(".")
-        url = f"{self.device.index}:none" if fmt == "avfoundation" else f"video={self.name}"
-        # 読む方の待ちを短くして、止めるときにすぐ気づけるようにする
-        return av.open(url, format=fmt, options=options, timeout=(10.0, 0.5))
-
-    def _run(self):
-        import av
-        try:
-            container = self._open_container()
-        except Exception as e:
-            self.error = f"カメラを開けません: {e}"
+    def _poll(self):
+        """子プロセスからの知らせ (形式が変わった、エラー) を受け取る。"""
+        latest_format = None
+        while True:
+            try:
+                msg = self._messages.get_nowait()
+            except queue.Empty:
+                break
+            if msg[0] == "format":
+                latest_format = msg
+                self._shm_names.append(msg[2])
+            elif msg[0] == "error":
+                self.error = msg[1]
+            elif msg[0] == "problem":
+                self.problem = msg[1]
+            elif msg[0] == "effects":
+                self.effects = msg[1]
+            elif msg[0] == "fps":                # 最初のコマの時刻から fps が分かった
+                self.fps = msg[1]
+                self._name_mode()
+        if latest_format is None:
             return
-        stream = container.streams.video[0]
-        rate = stream.average_rate or stream.guessed_rate
-        self.fps = float(rate) if rate else 0.0
+        _, serial, shm_name, fmt, w, h, fps = latest_format
         try:
-            while not self._stop.is_set():
-                try:
-                    for packet in container.demux(stream):
-                        if self._stop.is_set():
-                            break
-                        for frame in packet.decode():
-                            self._store(frame)
-                except Exception as e:
-                    # 読む待ちの時間切れ (映像が届いていない) は、止める合図を確かめて読み直す
-                    if self._stop.is_set():
-                        break
-                    text = str(e).lower()
-                    if isinstance(e, (av.error.ExitError, TimeoutError)) or "timed out" in text or "exit" in text:
-                        continue
-                    self.error = f"カメラから読めません: {e}"
-                    break
-        finally:
-            container.close()
-
-    def _store(self, frame):
-        fmt = "nv12" if frame.format.name == "nv12" else gpu_format(frame.format.name)
-        w, h = even_size(fmt, frame.width, frame.height)
-        with self._lock:
-            if (fmt, (w, h)) != (self.fmt, self.size) or not self._bufs:
-                self.fmt, self.size = fmt, (w, h)
-                self.mode_name = f"{w}×{h} {self.fps:.2f}fps" if self.fps else f"{w}×{h}"
-                self._bufs = [np.zeros(frame_size(fmt, w, h), np.uint8) for _ in range(BUFFERS)]
-                self._held = self._latest = -1
-            idx = next((i for i in range(len(self._bufs)) if i not in (self._held, self._latest)), -1)
-            bufs = self._bufs
-        self.frames += 1
-        self.last_frame_at = time.perf_counter()
-        if idx < 0:
-            self.dropped += 1
+            shm = attach_shared_memory(shm_name)
+        except FileNotFoundError:        # すでに次の形式に変わって片付けられた
             return
-        write_frame(bufs[idx], frame, fmt, w, h)
-        with self._lock:
-            if bufs is self._bufs:
-                self._latest = idx
-                self._latest_no = self.frames
-                self._latest_t = float(frame.time or 0.0)
+        nbytes = int(np.prod(frame_size(fmt, w, h)))
+        self._views = [np.ndarray((nbytes,), np.uint8, buffer=shm.buf, offset=i * nbytes)
+                       for i in range(capture.BUFFERS)]
+        self._close_shm()
+        self._shm = shm
+        self._serial = serial
+        self.fmt, self.size = fmt, (w, h)
+        self.fps = fps or self._state[capture.S_FPS]     # fps をコマの時刻から求めた後の形式の知らせもある
+        self._name_mode()
+
+    def _name_mode(self):
+        w, h = self.size
+        self.mode_name = f"{w}×{h} {self.fps:.2f}fps" if self.fps else f"{w}×{h}"
+
+    def _close_shm(self):
+        if self._shm is not None:
+            try:
+                self._shm.close()
+            except BufferError:          # まだ表示中のコマが指している。捨てられたときに閉じられる
+                pass
+            self._shm = None
 
     def latest(self):
-        with self._lock:
-            if self._latest < 0 or self._latest_no <= self.last_no:
+        self._poll()
+        st = self._state
+        with st.get_lock():
+            if int(st[capture.S_SERIAL]) != self._serial or not self._views:
                 return None
-            self._held = self._latest
-            self.last_no = self._latest_no
-            w, h = self.size
-            return Picture(self._latest_t + self.last_no * 1e-9, self.fmt, w, h, self._bufs[self._held])
+            idx, no = int(st[capture.S_LATEST]), int(st[capture.S_LATEST_NO])
+            if idx < 0 or no <= self.last_no:
+                return None
+            st[capture.S_HELD] = idx
+            t = st[capture.S_LATEST_T]
+        self.last_no = no
+        w, h = self.size
+        return Picture(t + no * 1e-9, self.fmt, w, h, self._views[idx])
 
     def stats(self):
-        return self.frames, self.dropped
+        return int(self._state[capture.S_FRAMES]), int(self._state[capture.S_DROPPED])
 
     @property
     def signal(self):
-        return time.perf_counter() - self.last_frame_at < 1.0
+        return time.time() - self._state[capture.S_LAST_AT] < 1.0
 
     def status(self):
+        self._poll()
         if self.error:
             return self.error
         if not self.signal:
@@ -375,10 +297,32 @@ class CameraInput:
         return Fraction(self.fps).limit_denominator(1001) if self.fps else Fraction(30)
 
     def close(self):
+        """読むのをやめる。止まらなければ (映像が届かずに待ち続けているなど) プロセスごと終わらせる。"""
+        if self._proc is None:
+            return
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=3)
-            self._thread = None
+        self._proc.join(timeout=0.5)        # 映像が届いていれば、1 コマのうちに止まる
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=2)
+            self._unlink_left()
+        self._proc = None
+        self._views = []
+        self._close_shm()
+
+    def _unlink_left(self):
+        """プロセスごと終わらせたときは、子プロセスが片付けられなかった共有メモリを消す。"""
+        self._poll()
+        for name in self._shm_names:
+            try:
+                shm = attach_shared_memory(name)
+            except FileNotFoundError:
+                continue
+            unlink_shared_memory(shm)
+            try:
+                shm.close()
+            except BufferError:
+                pass
 
 
 # ---------- 録画 ----------

@@ -450,6 +450,56 @@ def yuv_matrix(bt709, full_range, bits=8):
     return np.array(m, np.float32), offset
 
 
+# 自動WB
+WB_BANDS = 12          # 明るさ (G) で分ける段の数
+WB_SLOPE = (0.5, 2.0)  # 色ごとの倍率の範囲
+WB_SHIFT = 0.25        # 色ごとのずれ (黒の浮き・沈み) の範囲
+
+
+def white_balance(samples, bt709, full_range, bits=8):
+    """白と黒の色の崩れを直す、R・G・B それぞれの (倍率, ずれ) を求める。補正は c' = 倍率 × c + ずれ。
+
+    「どの明るさの部分も、平均すれば灰色のはず」とみなす。画素を G の明るさで段に分け、各段の平均の
+    R と B が G にそろうような 1 次式を、画素の多い段を重く見て求める。倍率だけでなくずれも直すので、
+    暗い部分ほど青い (黒が色づいている) カメラも、白と黒の両方がそろう。
+    samples は yuv_samples の (Y, Cb, Cr) の並び。明るさの幅が狭すぎて求められないときは None。
+    """
+    m, offset = yuv_matrix(bt709, full_range, bits)
+    rgb = (samples - np.array(offset, np.float32)) @ m.reshape(3, 3)     # 各画素の R, G, B
+    rgb = rgb[rgb.max(1) < 0.98]           # 白飛びした画素は色が分からない
+    if len(rgb) < 200:
+        return None
+    band = np.minimum((np.clip(rgb[:, 1], 0, None) * WB_BANDS).astype(int), WB_BANDS - 1)
+    count = np.bincount(band, minlength=WB_BANDS)
+    use = count >= max(20, len(rgb) * 0.005)
+    if use.sum() < 3:
+        return None
+    means = np.stack([np.bincount(band, rgb[:, c], WB_BANDS)[use] for c in range(3)], -1) / count[use, None]
+    if means[:, 1].max() - means[:, 1].min() < 0.1:
+        return None
+    gains, shifts = [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]
+    for c in (0, 2):
+        # 段の平均で c ≈ s × G + k。補正はその逆 (c - k) / s
+        s, k = np.polyfit(means[:, 1], means[:, c], 1, w=np.sqrt(count[use]))
+        s, k = float(np.clip(s, *WB_SLOPE)), float(np.clip(k, -WB_SHIFT, WB_SHIFT))
+        gains[c], shifts[c] = 1 / s, -k / s
+    return tuple(gains), tuple(shifts)
+
+
+def apply_white_balance(matrix, offset, wb):
+    """YUV → RGB の係数とオフセットに、自動WB の (倍率, ずれ) を入れる (シェーダーは変えずに済む)。
+
+    倍率は係数の行に掛ける。ずれ k は RGB に足す代わりに、同じだけ YUV のオフセットから引く:
+    M' (yuv - offset) + k = M' (yuv - (offset - M'⁻¹ k))。
+    """
+    if not wb:
+        return matrix, offset
+    gains, shifts = wb
+    m = (matrix.reshape(3, 3) * np.array(gains, np.float32)).reshape(-1)
+    shift = np.linalg.solve(m.reshape(3, 3).T.astype(np.float64), np.array(shifts))
+    return m.astype(np.float32), tuple(float(o - d) for o, d in zip(offset, shift))
+
+
 class TextureSet:
     """Y / U / V の 3 枚のテクスチャと、いま入っているコマ (key) と形 (layout)。"""
 
@@ -506,6 +556,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         self.setFormat(fmt)
         self._init_view()
         self.bt709, self.full_range = True, False
+        self.wb = None              # 自動WB の R・G・B の (倍率, ずれ) (入力の表示で使う。white_balance)
         self.program = None
         self.sets = []          # テクスチャの組 (表で使う組と、次のコマを先に送っておく裏の組)
         self.front = 0          # いま表示しているコマが入っている組
@@ -725,6 +776,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         fmt = self.picture.fmt
         bits = YUV_FORMATS[fmt][3]
         matrix, offset = yuv_matrix(self.bt709, self.full_range, bits)
+        matrix, offset = apply_white_balance(matrix, offset, self.wb)
         GL.glUniformMatrix3fv(self.loc["yuv_to_rgb"], 1, GL.GL_FALSE, matrix)
         GL.glUniform3f(self.loc["offset"], *offset)
         # 16bit テクスチャは 65535 を 1 として読めるので、bits ビットの最大値が 1 になるよう直す
@@ -767,7 +819,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
     def sdi_state(self):
         """SDI へ送る絵を決めるもの。変わったときだけ描き直して送る。"""
         return (self.serial, round(self.s, 9), round(self.tx, 3), round(self.ty, 3), self.width(), self.height(),
-                self.pixelated, self.bt709, self.full_range, id(self.sdi))
+                self.pixelated, self.bt709, self.full_range, self.wb, id(self.sdi))
 
     def _send_sdi(self, matrix, offset, fmt):
         """拡大中の絵を SDI の解像度で描き、2vuy / v210 に詰めて読み出し、SDI 出力へ渡す。
