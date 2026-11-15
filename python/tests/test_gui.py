@@ -215,6 +215,24 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(w.play_fps(), 120)
         self.assertEqual(w.speed(), 1)
 
+    def test_sdi_sequence_uses_frames_shown_on_screen(self):
+        """SDI に順番に並べるのは画面に出た新しいコマ。120fps の動画を 60Hz の画面で出すと画面には
+        1 秒に 60 コマしか出ないので、59.94 の出力には 1 枚ずつ並べる (2 枚に 1 枚ではない)。"""
+        w = self.w
+        w.sdi = mock.Mock()
+        w.sdi.mode.fps = 60000 / 1001
+        w.playing = True
+        try:
+            w.hz = 120.0
+            w.update_sdi_sequence()
+            self.assertEqual(w.sdi.sequence, (1, 2))
+            w.hz = 60.0
+            w.update_sdi_sequence()
+            self.assertEqual(w.sdi.sequence, (1, 1))
+        finally:
+            w.playing = False
+            w.sdi = None
+
     def test_forced_fps_changes_speed_not_numbering(self):
         """「60 で強制」なら 120fps の動画を 1 秒に 60 コマずつ再生する。コマ番号は動画のまま。"""
         w = self.w

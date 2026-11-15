@@ -71,6 +71,9 @@ if MAC:
             "CFBundleName": "Zoom Video Player",
             "CFBundleDisplayName": "Zoom Video Player",
             "NSHighResolutionCapable": True,
+            # 映像入力でカメラ (HDMI / SDI のキャプチャー機器を含む) を使う。書いていないと、
+            # カメラを開いたところで macOS がアプリを止める
+            "NSCameraUsageDescription": "カメラやキャプチャー機器の映像を表示・録画するために使います。",
             # Finder で動画を右クリック →「このアプリケーションで開く」に出す
             "CFBundleDocumentTypes": [{
                 "CFBundleTypeName": "Video",

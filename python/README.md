@@ -57,6 +57,24 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 確認: `.venv/bin/python tools/check_sdi.py` で、GPU が詰めたバイト列が計算どおりか（機器なしで確認）と、
 機器がつながっていれば実際に送れたコマ数を確かめます。
 
+## 映像入力（カメラ・Blackmagic の SDI 入力）
+
+上の「入力」で、動画ファイルの代わりにカメラや SDI 入力の映像を表示できます（GPU 描画のときだけ）。
+メニューは開くたびに機器を探し直します。「動画ファイル」に戻すと、開いていた動画の止めていた位置に戻ります。
+
+- **SDI 入力**（DeckLink / UltraStudio）: SDI 出力と同じライブラリ（`build_sdi_mac.sh` / `build_sdi.bat`）で受け取る。
+  入力の形式（解像度・fps）は機器が見分けて、変わればそれに合わせる。10bit 4:2:2 のまま受け取り、
+  画面・SDI 出力・録画に渡す（Blackmagic の機器はカメラとしても見えるが、10bit で受け取れる SDI 入力として出す）
+- **カメラ**（HDMI キャプチャー機器などを含む）: macOS は AVFoundation、Windows は DirectShow から FFmpeg で受け取る。
+  1080p の 60fps 前後があればそれを選び、無ければいちばん大きい形式。初めて使うときは macOS がカメラの使用許可を求める
+- 再生ボタン / Space で「静止」と「ライブ」を切り替える。止めている間も拡大・ピクセル表示・ミニマップが使える
+- 拡大した絵を SDI 出力へも出せる（入力の fps に合わせて順番に並べる）。SDI 入力と同じ機器の SDI 出力を
+  使うときは、出力をそのまま入力へつなぐ（折り返す）と映像が回り込むので注意
+- 「● 録画」/ R で、入力を .mov に録画する（音声は録らない）。10bit 4:2:2 の SDI 入力は HEVC の 10bit 4:2:2、
+  カメラは HEVC（使えなければ H.264）。Apple シリコンではハードウェアで書き出す（M1 で 1080p は 100fps 以上、
+  4K は 40fps 程度なので、4K 59.94 は書き出しが追いつかずコマを落とす。落としたコマ数は右上に出る）
+- 右上に、入力の形式・信号の有無・受け取りと表示の fps・録画の時間と落としたコマ数が出る
+
 ## 配布用ビルド
 
 - Windows: `build.bat` で `dist\ZoomVideoPlayer\ZoomVideoPlayer.exe` ができます（PyInstaller、フォルダ形式）。
@@ -108,6 +126,8 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `player_frames.py` | 画面側のフレーム、停止中のコマの記憶、デコードプロセスとの受け渡し |
 | `player_core.py` | デコード（PyAV）。再生中は別プロセスで動く |
 | `player_vsync.py` | 画面の書き換え（垂直同期）に合わせたコマの選び方 |
+| `player_live.py` | 映像入力（SDI 入力・カメラ）と録画 |
+| `player_gui_live.py` | メインウィンドウの映像入力の部分（入力の選択、表示、静止、録画、統計） |
 | `player_os.py` | OS ごとの違いがある処理（画面のスレッドの優先度、裏に回っても OS に遅らせない設定） |
 | `player_sdi.py` | Blackmagic SDI 出力（機器の一覧、送るスレッド、出力の拡大の置き換え） |
 | `sdi/decklink_bridge.cpp`, `build_sdi_mac.sh` / `build_sdi.bat` | DeckLink SDK を呼ぶライブラリとそのビルド（macOS / Windows） |

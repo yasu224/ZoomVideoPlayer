@@ -39,6 +39,48 @@ class VsyncTimerTest(unittest.TestCase):
         est = timer.update(52 * period + 0.0005, period)   # 49 の次が 52 (2 回飛ばした)
         self.assertAlmostEqual(est, 52 * period, delta=0.001)
 
+    def test_second_swap_in_same_refresh(self):
+        """macOS の 60Hz の 4K モニターのように、1 回の書き換えに入れ替えが 2 回通る (4 ms と 12.6 ms の
+        交互) とき、間隔が短いと分かった後は 2 回目を同じ書き換えとみなし、推定は書き換えの間隔どおりに進む。"""
+        period = 1 / 60
+        timer = VsyncTimer()
+        ests = []
+        for k in range(200):
+            for measured, second in ((k * period + 0.0005, False), (k * period + 0.0045, True)):
+                same = timer.same_refresh(measured, period)
+                if k >= 20:
+                    self.assertEqual(same, second)
+                if not same:
+                    ests.append((k, timer.update(measured, period)))
+        steps = [b - a for (k, a), (_, b) in zip(ests, ests[1:]) if k >= 20]
+        self.assertLess(max(abs(s - period) for s in steps), 0.0006)
+
+    def test_learned_doubling_survives_reset(self):
+        """再生し直しても (reset)、入れ替えが 2 回通る画面だと覚えていて、最初の書き換えから数え分ける。"""
+        period = 1 / 60
+        timer = VsyncTimer()
+        for k in range(30):
+            for measured in (k * period, k * period + 0.004):
+                if not timer.same_refresh(measured, period):
+                    timer.update(measured, period)
+        timer.reset()
+        t = 10.0
+        self.assertFalse(timer.same_refresh(t, period))
+        timer.update(t, period)
+        self.assertTrue(timer.same_refresh(t + 0.004, period))
+        self.assertFalse(timer.same_refresh(t + period, period))
+
+    def test_late_notice_is_not_same_refresh(self):
+        """知らせが遅れても (144Hz で 0〜9 ms)、次の書き換えの知らせは同じ書き換えとみなさない。"""
+        rnd = random.Random(2)
+        period = 1 / 144
+        timer = VsyncTimer()
+        for k in range(300):
+            measured = k * period + rnd.choice((0.0, 0.009, rnd.uniform(0, 0.009)))
+            self.assertFalse(timer.same_refresh(measured, period))
+            timer.update(measured, period)
+        self.assertFalse(timer.doubled)
+
 
 class VsyncLockTest(unittest.TestCase):
     def test_advances_one_step_per_swap(self):
