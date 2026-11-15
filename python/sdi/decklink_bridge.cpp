@@ -17,6 +17,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -25,6 +26,7 @@
 #endif
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -494,4 +496,322 @@ ZVP_EXPORT void zvp_dl_close(Output* o) {
     o->out->Release();
     o->out = nullptr;
     o->Release();
+}
+
+// ======================================================================================
+// 入力 (SDI などの映像を受け取る)
+//
+// 入力の形式 (解像度・fps) は機器に見分けさせる (format detection)。届いたコマは 10bit YUV 4:2:2 (v210) で
+// 受け取り、P210 (Y のプレーンと、Cb Cr を交互に並べたプレーン。10bit を 16bit の上位に詰める) にほどいて、
+// Python が用意したバッファへ書く。P210 は画面 (GPU) がそのまま読め、録画 (HEVC) にもそのまま渡せる。
+// バッファは何枚かを順に使い、画面が表示中の 1 枚 (held) と最新の 1 枚 (latest) には書かない。
+// ======================================================================================
+
+namespace {
+
+std::vector<IDeckLink*> g_inputs;
+
+// v210 の 6 画素 (4 語) → P210 の Y 6 つと CbCr 3 組。v210 の並び:
+//   語 0: Cb0 Y0 Cr0 / 語 1: Y1 Cb1 Y2 / 語 2: Cr1 Y3 Cb2 / 語 3: Y4 Cr2 Y5 (各語の下位から 10bit ずつ)
+// P210 は 10bit を 16bit の上位に詰めるので、各値を 6 ビット左へずらす。取り出しとずらしをまとめて、
+// 「下位 10bit を 6 ビット上げる」は (w << 6)、「11〜20 ビット目」は ((w >> 4) & 0xFFC0)、
+// 「21〜30 ビット目」は ((w >> 14) & 0xFFC0) の 1 回で済ませる
+inline void unpack_v210_group(const uint32_t* s, uint16_t* y, uint16_t* uv) {
+    uint32_t w0 = s[0], w1 = s[1], w2 = s[2], w3 = s[3];
+    uv[0] = (uint16_t)(w0 << 6);
+    y[0] = (uint16_t)((w0 >> 4) & 0xFFC0);
+    uv[1] = (uint16_t)((w0 >> 14) & 0xFFC0);
+    y[1] = (uint16_t)(w1 << 6);
+    uv[2] = (uint16_t)((w1 >> 4) & 0xFFC0);
+    y[2] = (uint16_t)((w1 >> 14) & 0xFFC0);
+    uv[3] = (uint16_t)(w2 << 6);
+    y[3] = (uint16_t)((w2 >> 4) & 0xFFC0);
+    uv[4] = (uint16_t)((w2 >> 14) & 0xFFC0);
+    y[4] = (uint16_t)(w3 << 6);
+    uv[5] = (uint16_t)((w3 >> 4) & 0xFFC0);
+    y[5] = (uint16_t)((w3 >> 14) & 0xFFC0);
+}
+
+// v210 の 1 行 → P210 の Y の行と CbCr の行 (1080p で 0.7 ms、4K で 2.8 ms)。
+// 幅が 6 の倍数でないとき (1280 など) は、最後のかたまりだけ一時の場所にほどいて要る分を写す
+void unpack_v210_row(const uint32_t* src, uint16_t* y, uint16_t* uv, int width) {
+    int full = width / 6 * 6, x = 0;
+    for (; x < full; x += 6, src += 4)
+        unpack_v210_group(src, y + x, uv + x);
+    if (x < width) {
+        uint16_t ty[6], tuv[6];
+        unpack_v210_group(src, ty, tuv);
+        int n = width - x;
+        std::memcpy(y + x, ty, n * sizeof(uint16_t));
+        std::memcpy(uv + x, tuv, ((n + 1) / 2) * 2 * sizeof(uint16_t));
+    }
+}
+
+}  // namespace
+
+class InputCapture : public IDeckLinkInputCallback {
+public:
+    IDeckLinkInput* in = nullptr;
+    std::mutex lock;
+    int32_t width = 0, height = 0;
+    BMDTimeValue duration = 0;
+    BMDTimeScale scale = 0;
+    std::string mode_name, error;
+    int64_t serial = 0;              // 入力の形式が変わった回数
+    bool signal = false;             // 入力に信号があるか
+    int64_t frames = 0, dropped = 0; // 届いたコマ / 書けずに捨てたコマ
+    std::vector<uint8_t*> bufs;      // Python が用意した P210 のバッファ
+    int32_t buf_w = 0, buf_h = 0;
+    int held = -1, latest = -1, writing = -1;
+    int64_t latest_no = 0;
+    double latest_t = 0;
+    std::atomic<int> refs{1};
+
+    void set_mode(IDeckLinkDisplayMode* m) {
+        width = (int32_t)m->GetWidth();
+        height = (int32_t)m->GetHeight();
+        m->GetFrameRate(&duration, &scale);
+        dl_string name = nullptr;
+        m->GetName(&name);
+        mode_name = to_string(name);
+    }
+
+    HRESULT ZVP_CALL VideoInputFormatChanged(BMDVideoInputFormatChangedEvents, IDeckLinkDisplayMode* m,
+                                             BMDDetectedVideoInputFormatFlags flags) override {
+        com_init();
+        in->PauseStreams();
+        in->EnableVideoInput(m->GetDisplayMode(), bmdFormat10BitYUV, bmdVideoInputEnableFormatDetection);
+        in->FlushStreams();
+        in->StartStreams();
+        std::lock_guard<std::mutex> g(lock);
+        set_mode(m);
+        error = (flags & bmdDetectedVideoInputRGB444) ? "RGB の入力には対応していません" : "";
+        latest = -1;
+        serial++;
+        return S_OK;
+    }
+
+    HRESULT ZVP_CALL VideoInputFrameArrived(IDeckLinkVideoInputFrame* f, IDeckLinkAudioInputPacket*) override {
+        if (!f)
+            return S_OK;
+        int idx = -1;
+        int32_t w = (int32_t)f->GetWidth(), h = (int32_t)f->GetHeight();
+        {
+            std::lock_guard<std::mutex> g(lock);
+            signal = !(f->GetFlags() & bmdFrameHasNoInputSource);
+            if (!signal)
+                return S_OK;
+            frames++;
+            if (bufs.empty() || buf_w != w || buf_h != h || f->GetPixelFormat() != bmdFormat10BitYUV) {
+                dropped++;
+                return S_OK;
+            }
+            for (int i = 0; i < (int)bufs.size(); i++)
+                if (i != held && i != latest) {
+                    idx = i;
+                    break;
+                }
+            if (idx < 0) {
+                dropped++;
+                return S_OK;
+            }
+            writing = idx;
+        }
+        // ほどくのは lock の外で行う (4K では数 ms かかり、その間も画面側が最新のコマを取れるように)
+        IDeckLinkVideoBuffer* vb = nullptr;
+        bool ok = false;
+        if (f->QueryInterface(IID_IDeckLinkVideoBuffer, (void**)&vb) == S_OK) {
+            void* bytes = nullptr;
+            if (vb->StartAccess(bmdBufferAccessRead) == S_OK) {
+                if (vb->GetBytes(&bytes) == S_OK) {
+                    long row_bytes = f->GetRowBytes();
+                    uint16_t* y = (uint16_t*)bufs[idx];
+                    uint16_t* uv = y + (size_t)w * h;
+                    for (int r = 0; r < h; r++)
+                        unpack_v210_row((const uint32_t*)((const uint8_t*)bytes + (size_t)row_bytes * r),
+                                        y + (size_t)w * r, uv + (size_t)w * r, w);
+                    ok = true;
+                }
+                vb->EndAccess(bmdBufferAccessRead);
+            }
+            vb->Release();
+        }
+        BMDTimeValue t = 0, d = 0;
+        f->GetStreamTime(&t, &d, 1000000);
+        std::lock_guard<std::mutex> g(lock);
+        writing = -1;
+        if (!ok) {
+            dropped++;
+            return S_OK;
+        }
+        latest = idx;
+        latest_no = frames;
+        latest_t = (double)t / 1000000.0;
+        return S_OK;
+    }
+
+    HRESULT ZVP_CALL QueryInterface(REFIID, void** ppv) override {
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG ZVP_CALL AddRef() override { return ++refs; }
+    ULONG ZVP_CALL Release() override {
+        ULONG r = --refs;
+        if (r == 0)
+            delete this;
+        return r;
+    }
+};
+
+// 入力のある機器を探し直す。数を返す (ドライバが無ければ -1)。
+ZVP_EXPORT int zvp_in_refresh() {
+    com_init();
+    std::lock_guard<std::mutex> g(g_lock);
+    for (auto* d : g_inputs)
+        d->Release();
+    g_inputs.clear();
+    IDeckLinkIterator* it = create_iterator();
+    if (!it)
+        return -1;
+    IDeckLink* d = nullptr;
+    while (it->Next(&d) == S_OK) {
+        IDeckLinkInput* in = nullptr;
+        if (d->QueryInterface(IID_IDeckLinkInput, (void**)&in) == S_OK) {
+            in->Release();
+            g_inputs.push_back(d);
+        } else {
+            d->Release();
+        }
+    }
+    it->Release();
+    return (int)g_inputs.size();
+}
+
+ZVP_EXPORT int zvp_in_device_name(int dev, char* buf, int len) {
+    com_init();
+    std::lock_guard<std::mutex> g(g_lock);
+    if (dev < 0 || dev >= (int)g_inputs.size())
+        return -1;
+    dl_string name = nullptr;
+    g_inputs[dev]->GetDisplayName(&name);
+    copy_out(to_string(name), buf, len);
+    return 0;
+}
+
+// 入力を始める。初めは 1080p59.94 で待ち、信号が来たら機器が見分けた形式に切り替える。
+ZVP_EXPORT InputCapture* zvp_in_open(int dev, char* err, int err_len) {
+    com_init();
+    std::lock_guard<std::mutex> g(g_lock);
+    if (dev < 0 || dev >= (int)g_inputs.size()) {
+        copy_out("機器が見つかりません", err, err_len);
+        return nullptr;
+    }
+    auto* c = new InputCapture();
+    if (g_inputs[dev]->QueryInterface(IID_IDeckLinkInput, (void**)&c->in) != S_OK) {
+        copy_out("入力を使えません", err, err_len);
+        c->Release();
+        return nullptr;
+    }
+    IDeckLinkDisplayMode* m = nullptr;
+    if (c->in->GetDisplayMode(bmdModeHD1080p5994, &m) == S_OK) {
+        c->set_mode(m);
+        m->Release();
+    }
+    HRESULT r = c->in->EnableVideoInput(bmdModeHD1080p5994, bmdFormat10BitYUV, bmdVideoInputEnableFormatDetection);
+    if (r != S_OK || c->in->SetCallback(c) != S_OK || c->in->StartStreams() != S_OK) {
+        copy_out(r == E_ACCESSDENIED ? "ほかのアプリが入力を使っています" : "入力を始められませんでした", err, err_len);
+        c->in->SetCallback(nullptr);
+        c->in->DisableVideoInput();
+        c->in->Release();
+        c->in = nullptr;
+        c->Release();
+        return nullptr;
+    }
+    return c;
+}
+
+// 入力の形式。信号の有無、形式が変わった回数 (変わったらバッファを用意し直す)、問題があればその説明。
+ZVP_EXPORT int zvp_in_format(InputCapture* c, int32_t* w, int32_t* h, int64_t* duration, int64_t* scale,
+                             char* name, int name_len, int64_t* serial, int32_t* signal, char* err, int err_len) {
+    if (!c)
+        return -1;
+    std::lock_guard<std::mutex> g(c->lock);
+    *w = c->width;
+    *h = c->height;
+    *duration = c->duration;
+    *scale = c->scale;
+    copy_out(c->mode_name, name, name_len);
+    *serial = c->serial;
+    *signal = c->signal ? 1 : 0;
+    copy_out(c->error, err, err_len);
+    return 0;
+}
+
+// P210 のバッファ (各 width * height * 4 バイト) を渡す。書き込み中のコマがあれば書き終わるのを待つ。
+ZVP_EXPORT int zvp_in_set_buffers(InputCapture* c, void** bufs, int n, int32_t w, int32_t h) {
+    if (!c)
+        return -1;
+    std::unique_lock<std::mutex> g(c->lock);
+    while (c->writing >= 0) {
+        g.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        g.lock();
+    }
+    c->bufs.assign((uint8_t**)bufs, (uint8_t**)bufs + n);
+    c->buf_w = w;
+    c->buf_h = h;
+    c->held = c->latest = -1;
+    return 0;
+}
+
+// after より新しいコマがあれば、そのバッファの番号を返して表示中 (held) にする (前の held は手放す)。
+// 無ければ -1。no にコマの通し番号、t に入力の時刻 (秒)。
+ZVP_EXPORT int zvp_in_latest(InputCapture* c, int64_t after, int64_t* no, double* t) {
+    if (!c)
+        return -1;
+    std::lock_guard<std::mutex> g(c->lock);
+    if (c->latest < 0 || c->latest_no <= after)
+        return -1;
+    c->held = c->latest;
+    *no = c->latest_no;
+    *t = c->latest_t;
+    return c->held;
+}
+
+// 表示中のバッファを手放す (入力を切り替えるときなど)。
+ZVP_EXPORT void zvp_in_release(InputCapture* c) {
+    if (!c)
+        return;
+    std::lock_guard<std::mutex> g(c->lock);
+    c->held = -1;
+}
+
+ZVP_EXPORT int zvp_in_stats(InputCapture* c, int64_t* frames, int64_t* dropped) {
+    if (!c)
+        return -1;
+    std::lock_guard<std::mutex> g(c->lock);
+    *frames = c->frames;
+    *dropped = c->dropped;
+    return 0;
+}
+
+ZVP_EXPORT void zvp_in_close(InputCapture* c) {
+    com_init();
+    if (!c)
+        return;
+    c->in->StopStreams();
+    c->in->SetCallback(nullptr);
+    c->in->DisableVideoInput();
+    c->in->Release();
+    c->in = nullptr;
+    c->Release();
+}
+
+// v210 のコマ (row_bytes ずつの行) を P210 (Y の後に CbCr) にほどく。確かめるとき用 (入力では使わない)。
+ZVP_EXPORT void zvp_unpack_v210(const void* src, int64_t row_bytes, void* dst, int32_t width, int32_t height) {
+    uint16_t* y = (uint16_t*)dst;
+    uint16_t* uv = y + (size_t)width * height;
+    for (int r = 0; r < height; r++)
+        unpack_v210_row((const uint32_t*)((const uint8_t*)src + row_bytes * r), y + (size_t)width * r,
+                        uv + (size_t)width * r, width);
 }
