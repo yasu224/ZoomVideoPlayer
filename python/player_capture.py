@@ -8,6 +8,7 @@ macOS のカメラ (AVFoundation) では、映像が届いていないと FFmpeg
 画面が表示中のバッファ (held) と最新のバッファには書かない。形式が変わったら新しい共有メモリを作り、
 その名前を queue で知らせる。
 """
+import re
 import sys
 import time
 
@@ -73,9 +74,15 @@ def camera_names():
     return list(enumerate(names))
 
 
-def camera_modes(index):
-    """カメラの使える (幅, 高さ, fps) の一覧 (macOS)。わざと無い fps を指定して、一覧のログを出させる。"""
-    if camera_format() != "avfoundation":
+def camera_modes(index, name=None):
+    """カメラの使える (幅, 高さ, fps) の一覧。Windows は (幅, 高さ, fps, 形式の指定) の一覧。
+
+    macOS はわざと無い fps を指定して一覧のログを出させる。Windows は DirectShow に一覧を出させる。
+    """
+    fmt = camera_format()
+    if fmt == "dshow":
+        return parse_dshow_modes(ffmpeg_log(f"video={name}", "dshow", {"list_options": "true"}))
+    if fmt != "avfoundation":
         return []
     modes = []
     for line in ffmpeg_log(f"{index}:none", "avfoundation", {"framerate": "1234"}):
@@ -90,13 +97,29 @@ def camera_modes(index):
     return sorted(set(modes))
 
 
+DSHOW_MODE = re.compile(r"(vcodec|pixel_format)=(\S+)\s+min s=\d+x\d+ fps=[\d.]+\s+max s=(\d+)x(\d+) fps=([\d.]+)")
+
+
+def parse_dshow_modes(lines):
+    """DirectShow の list_options の行 (「pixel_format=yuyv422  min s=… fps=… max s=1920x1080 fps=60」など)
+    から、(幅, 高さ, いちばん高い fps, ("pixel_format" か "vcodec", その値)) の一覧を作る。"""
+    modes = set()
+    for line in lines:
+        m = DSHOW_MODE.search(line)
+        if m:
+            kind, value, w, h, fps = m.groups()
+            modes.add((int(w), int(h), float(fps), (kind, value)))
+    return sorted(modes)
+
+
 def best_mode(modes):
-    """1080p の 60fps 前後を優先し、無ければいちばん大きく、fps の高いもの。"""
+    """1080p の 60fps 前後を優先し、無ければいちばん大きく、fps の高いもの。
+    同じ大きさと fps なら、圧縮していない形式 (pixel_format) を選ぶ (MJPEG などは展開に CPU を使う)。"""
     if not modes:
         return None
     full_hd = [m for m in modes if (m[0], m[1]) == (1920, 1080) and m[2] <= 61]
     pool = full_hd or [m for m in modes if m[2] <= 61] or modes
-    return max(pool, key=lambda m: (m[0] * m[1], m[2]))
+    return max(pool, key=lambda m: (m[0] * m[1], m[2], len(m) < 4 or m[3][0] == "pixel_format"))
 
 
 class CameraEffects:
@@ -171,10 +194,12 @@ def open_camera(index, name):
         return av.open(index)
     fmt = camera_format()
     options = {"pixel_format": "nv12"} if fmt == "avfoundation" else {}
-    mode = best_mode(camera_modes(index))
+    mode = best_mode(camera_modes(index, name))
     if mode:
         options["video_size"] = f"{mode[0]}x{mode[1]}"
         options["framerate"] = f"{mode[2]:.6f}".rstrip("0").rstrip(".")
+        if len(mode) > 3:                    # Windows: その大きさと fps を出せる形式も指定する
+            options[mode[3][0]] = mode[3][1]
     url = f"{index}:none" if fmt == "avfoundation" else f"video={name}"
     return av.open(url, format=fmt, options=options, timeout=(10.0, 0.5))
 

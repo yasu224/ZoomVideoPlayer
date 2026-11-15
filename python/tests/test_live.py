@@ -25,6 +25,24 @@ class CameraModeTest(unittest.TestCase):
         self.assertEqual(player_capture.best_mode(modes), (1280, 720, 59.94))
         self.assertIsNone(player_capture.best_mode([]))
 
+    def test_windows_modes(self):
+        """Windows (DirectShow) の一覧から形式も選ぶ。同じ大きさと fps なら圧縮していない形式を選ぶ。"""
+        lines = [
+            'DirectShow video device options (from video devices)',
+            ' Pin "Capture" (alternative pin name "0")',
+            '  pixel_format=yuyv422  min s=640x480 fps=5 max s=640x480 fps=30',
+            '  pixel_format=yuyv422  min s=1920x1080 fps=5 max s=1920x1080 fps=5',
+            '  vcodec=mjpeg  min s=1920x1080 fps=5 max s=1920x1080 fps=60.0002',
+            '  vcodec=mjpeg  min s=1920x1080 fps=5 max s=1920x1080 fps=60.0002 (tv, bt470bg/bt709/unknown, center)',
+            '  pixel_format=nv12  min s=1280x720 fps=5 max s=1280x720 fps=60',
+            '  vcodec=mjpeg  min s=1280x720 fps=5 max s=1280x720 fps=60',
+        ]
+        modes = player_capture.parse_dshow_modes(lines)
+        self.assertEqual(len(modes), 5)
+        self.assertEqual(player_capture.best_mode(modes), (1920, 1080, 60.0002, ("vcodec", "mjpeg")))
+        same = [m for m in modes if m[:2] == (1280, 720)]
+        self.assertEqual(player_capture.best_mode(same), (1280, 720, 60.0, ("pixel_format", "nv12")))
+
 
 class CameraCaptureTest(unittest.TestCase):
     """カメラを読む側 (別プロセスで動く player_capture.CameraCapture) を、作り物のカメラで同じプロセスの中で動かす。"""

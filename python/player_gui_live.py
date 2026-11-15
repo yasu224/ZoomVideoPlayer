@@ -4,6 +4,7 @@ MainWindow がこのクラスを受け継ぐ。再生の流れ (on_swapped / on_
 入力を表示している間だけ呼ばれる。入力そのもの (機器とのやり取り・録画の書き出し) は player_live。
 """
 import os
+import sys
 import time
 
 from PySide6.QtCore import QCameraPermission, QSettings, Qt
@@ -60,8 +61,9 @@ class LiveMixin:
             return self.with_camera_permission(device)
         self.open_live(device)
 
-    # macOS はカメラを使う前に許可が要る。許可されていないと、FFmpeg はダイアログも出さずにコマを待ち続け、
-    # 「信号なし」のままになる。カメラを開く前に確かめ、まだ聞いていなければ許可のダイアログを出す
+    # カメラを使う前に OS の許可が要る (macOS。Windows はプライバシーの設定で切られていると使えない)。
+    # macOS で許可されていないと、FFmpeg はダイアログも出さずにコマを待ち続け、「信号なし」のままになる。
+    # カメラを開く前に確かめ、まだ聞いていなければ許可のダイアログを出す (許可の要らない OS では常に許可)
     def with_camera_permission(self, device):
         app = QApplication.instance()
         permission = QCameraPermission()
@@ -75,8 +77,10 @@ class LiveMixin:
             app.requestPermission(permission, self, answered)
             return
         self.show_input_file()
-        QMessageBox.warning(self, "入力", "カメラの使用が許可されていません。\n"
-                            "システム設定 → プライバシーとセキュリティ → カメラ で、このアプリを許可してください。")
+        where = ("設定 → プライバシーとセキュリティ → カメラ で、デスクトップ アプリがカメラを使えるようにしてください。"
+                 if sys.platform == "win32" else
+                 "システム設定 → プライバシーとセキュリティ → カメラ で、このアプリを許可してください。")
+        QMessageBox.warning(self, "入力", f"カメラの使用が許可されていません。\n{where}")
 
     def open_live(self, device):
         try:
