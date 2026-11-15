@@ -38,11 +38,41 @@ class VsyncTimer:
     書き換えを飛ばしたとみなして進める。長く途切れたら届いた時刻からやり直す。
     """
 
+    SAMPLES = 16          # 知らせの間隔を平均する数
+
     def __init__(self):
         self.est = None
+        self.intervals = []   # 最近の知らせの間隔 (止まっていた間は除く)
+        self.last = None      # 直前の知らせの時刻
+        self.doubled = False  # 入れ替えが書き換えより多く通っている (same_refresh)
 
     def reset(self):
+        """推定をやり直す。入れ替えの通り方 (doubled) は画面の性質なので覚えておく。"""
         self.est = None
+
+    def same_refresh(self, measured, period):
+        """この知らせが、直前の書き換えと同じ書き換えの間の入れ替えか。知らせのたびに呼ぶ。
+
+        macOS の 60Hz の外部モニター (4K) では、OpenGL の入れ替えが 1 回の書き換えに 2 回通ることがある
+        (知らせの間隔が 4 ms と 12.6 ms の交互になり、1 秒に 110 回ほど来る)。これを書き換えと数えると、
+        書き換え 1 回分ずつ進める VsyncLock が倍近い速さで進んでしまう。
+        知らせの間隔は 1 回だけなら遅れの揺れで短くなるので (遅れた知らせのすぐ後に遅れない知らせ)、
+        最近の SAMPLES 回の平均の間隔が書き換えの間隔よりはっきり短いときだけ、2 回通っているとみなし、
+        推定した前回の書き換えから半回分も経たずに来た知らせを数えない。
+        """
+        if period <= 0:
+            return False
+        if self.last is not None and measured - self.last < 4 * period:
+            self.intervals.append(measured - self.last)
+            del self.intervals[:-self.SAMPLES]
+        self.last = measured
+        if len(self.intervals) == self.SAMPLES:
+            mean = sum(self.intervals) / self.SAMPLES
+            if mean < 0.75 * period:
+                self.doubled = True
+            elif mean > 0.9 * period:
+                self.doubled = False
+        return self.doubled and self.est is not None and measured - self.est < 0.5 * period
 
     def update(self, measured, period):
         if self.est is None or period <= 0:

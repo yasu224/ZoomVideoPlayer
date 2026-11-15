@@ -428,10 +428,13 @@ class MainWindow(QMainWindow):
 
     def update_sdi_sequence(self):
         """再生中で、動画の進む速さと出力の fps が整数倍なら、画面に出たコマを順番に並べて出す
-        (出力の時計と画面の時計のずれで、コマが重なったり飛んだりしないように)。"""
+        (出力の時計と画面の時計のずれで、コマが重なったり飛んだりしないように)。
+
+        並べるのは画面に出た新しいコマなので、比べるのは画面に新しいコマが出る速さ。画面の Hz が
+        動画の進む速さより低いと (120fps の動画を 60Hz の画面で出すなど) 画面には Hz の分しか出ない。"""
         if self.sdi is None:
             return
-        rate = self.fps() * self.speed() if self.src else 0.0
+        rate = min(self.fps() * self.speed(), self.hz) if self.src else 0.0
         self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, rate) if self.playing else None
 
     def stop_sdi(self):
@@ -835,6 +838,11 @@ class MainWindow(QMainWindow):
                 self.view_shown = shown
                 self.vsync.reset()
                 self.update_lock()
+            if shown and self.vsync.same_refresh(self.last_swap, 1 / self.hz):
+                # 同じ書き換えの間の 2 回目の入れ替え (VsyncTimer.same_refresh): 進めずに同じコマを描き直す。
+                # 描かないと、次の入れ替えの知らせが来ず流れが止まる
+                self.view.render_soon()
+                return
             self.swap_wall = self.vsync.update(self.last_swap, 1 / self.hz) if shown else self.last_swap
             clock = self.decoder.clock
             lock = self.lock
@@ -991,6 +999,7 @@ class MainWindow(QMainWindow):
             return
         hz = self.hz = self.refresh_rate()
         self.update_lock()                    # ウィンドウを別の画面へ動かしたときのため
+        self.update_sdi_sequence()
         if not self.playing:
             self.view.stats_text = (f"一時停止中\n動画 {fmt_fps(self.fps())} fps{self.forced_label()}"
                                     f" ・ 画面 {round(hz)} Hz ・ {self.renderer_label()}{self.sdi_label()}")

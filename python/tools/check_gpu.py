@@ -159,16 +159,23 @@ def main():
         wait(1.0)
         w.update_stats()
         shown = decoded = 0.0
+        stopped = False
         for _ in range(4):
             wait(0.5)
+            if not w.playing:             # 再生が速すぎて終端に達したなど (統計は「一時停止中」になる)
+                stopped = True
+                break
             text = w.view.stats_text
             shown += float(text.split()[1])
             decoded += float(text.split("デコード ")[1].split()[0])
         w.pause()
         shown, decoded = shown / 4, decoded / 4
         want = min(fps * speed, hz)
-        results.append((f"再生 {fps}fps {speed}x (目標 {want:.0f} コマ/秒)", f"描画 {shown:.1f} / デコード {decoded:.0f}",
-                        shown >= want * 0.95))
+        name = f"再生 {fps}fps {speed}x (目標 {want:.0f} コマ/秒)"
+        if stopped:
+            results.append((name, f"再生が止まった (位置 {w.frame_index()} コマ目)", False))
+        else:
+            results.append((name, f"描画 {shown:.1f} / デコード {decoded:.0f}", shown >= want * 0.95))
     w.close()
 
     print()
