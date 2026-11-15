@@ -838,12 +838,13 @@ class MainWindow(QMainWindow):
                 self.view_shown = shown
                 self.vsync.reset()
                 self.update_lock()
-            if shown and self.vsync.same_refresh(self.last_swap, 1 / self.hz):
+            period = 1 / self.hz
+            if shown and self.vsync.same_refresh(self.last_swap, period):
                 # 同じ書き換えの間の 2 回目の入れ替え (VsyncTimer.same_refresh): 進めずに同じコマを描き直す。
                 # 描かないと、次の入れ替えの知らせが来ず流れが止まる
                 self.view.render_soon()
                 return
-            self.swap_wall = self.vsync.update(self.last_swap, 1 / self.hz) if shown else self.last_swap
+            self.swap_wall = self.vsync.update(self.last_swap, period) if shown else self.last_swap
             clock = self.decoder.clock
             lock = self.lock
             if lock and lock.t is not None and clock.started:

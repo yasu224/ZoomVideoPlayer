@@ -9,6 +9,7 @@ GPU 描画では、表と裏の画面を入れ替えた知らせ (frameSwapped) 
   飛ばしたと取り違えてコマが飛ぶので、それはしない。本当に遅れたときだけ、壁時計との差で追いつく。
 """
 import math
+from collections import deque
 
 
 def vsync_lock_step(fps, speed, hz, tolerance=0.01):
@@ -42,7 +43,7 @@ class VsyncTimer:
 
     def __init__(self):
         self.est = None
-        self.intervals = []   # 最近の知らせの間隔 (止まっていた間は除く)
+        self.intervals = deque(maxlen=self.SAMPLES)   # 最近の知らせの間隔 (止まっていた間は除く)
         self.last = None      # 直前の知らせの時刻
         self.doubled = False  # 入れ替えが書き換えより多く通っている (same_refresh)
 
@@ -64,7 +65,6 @@ class VsyncTimer:
             return False
         if self.last is not None and measured - self.last < 4 * period:
             self.intervals.append(measured - self.last)
-            del self.intervals[:-self.SAMPLES]
         self.last = measured
         if len(self.intervals) == self.SAMPLES:
             mean = sum(self.intervals) / self.SAMPLES
