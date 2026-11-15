@@ -731,7 +731,12 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glUniform1f(self.loc["scale"], texture_scale(fmt))
         GL.glUniform1f(self.loc["semi"], 1.0 if fmt in SEMI else 0.0)
         filt = GL.GL_NEAREST if self.pixelated else GL.GL_LINEAR
-        for unit, (tex, name) in enumerate(zip(self.sets[self.front].textures, ("tex_y", "tex_u", "tex_v"))):
+        textures = list(self.sets[self.front].textures)
+        if fmt in SEMI:
+            # 色差を交互に並べた形式は 2 枚しか使わない。3 枚目に中身の無いテクスチャを付けたままだと
+            # (シェーダーは読まないが) ドライバが警告を出すので、色差のテクスチャを付けておく
+            textures[2] = textures[1]
+        for unit, (tex, name) in enumerate(zip(textures, ("tex_y", "tex_u", "tex_v"))):
             GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, filt)

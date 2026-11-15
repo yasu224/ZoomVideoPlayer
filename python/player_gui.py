@@ -7,6 +7,8 @@ PySide6 で画面を作り、PyAV (FFmpeg) で動画をデコードする。モ�
 - player_vsync.py  画面の書き換え (垂直同期) に合わせたコマの選び方
 - player_sdi.py    Blackmagic の SDI 出力 (機器の一覧、送るスレッド)
 - player_os.py     OS ごとの違いがある処理 (スレッドの優先度、裏に回ったときの遅れ)
+- player_live.py   映像入力 (カメラ・SDI 入力) と録画
+- player_gui_live.py  メインウィンドウの映像入力の部分 (LiveMixin)
 - player_gui.py    このファイル
 
 起動は zoom_player.py から行う。
@@ -18,6 +20,7 @@ import time
 from player_core import END_OF_FILE, WRAP, VideoSource, even_size, gpu_format, probe_hw
 from player_frames import BackFiller, Decoder, FrameCache, make_picture
 import player_sdi
+from player_gui_live import LiveMixin
 from player_os import KeepRunning, raise_ui_thread_priority
 from player_view import CpuView, GpuWindow, gpu_wanted
 from player_vsync import VsyncLock, VsyncTimer, vsync_lock_step
@@ -68,7 +71,11 @@ L\tループ再生 ON / OFF
 \\\t区間ループ解除
 F\tフルスクリーン
 
-※ 音声は再生しません (映像の確認用)。"""
+入力 (カメラ・SDI 入力) を表示しているとき
+Space / K\t静止 / ライブ (止めている間も拡大できる)
+R\t録画の開始 / 停止
+
+※ 音声は再生も録画もしません (映像の確認用)。"""
 if sys.platform == "darwin":
     HELP_TEXT = HELP_TEXT.replace("Ctrl+ドラッグ", "⌘+ドラッグ (control+ドラッグ)")
 
@@ -85,7 +92,7 @@ def fmt_fps(f):
 
 
 class SdiCombo(QComboBox):
-    """SDI 出力の選択。開くたびに機器と出力形式を読み直す (後からつないだ機器も出るように)。"""
+    """開くたびに中身を読み直すメニュー (SDI 出力、入力。後からつないだ機器も出るように)。"""
 
     refresh = None
 
@@ -120,7 +127,7 @@ class SeekSlider(QSlider):
         p.drawRoundedRect(QRectF(x(a), groove.center().y() - 3, max(2, x(b) - x(a)), 6), 3, 3)
 
 
-class MainWindow(QMainWindow):
+class MainWindow(LiveMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         raise_ui_thread_priority()
@@ -147,6 +154,10 @@ class MainWindow(QMainWindow):
         self.cache = FrameCache()    # 停止中に見たコマ (戻るコマ送りを速くする)
         self.scrub_value = None      # シークバーをドラッグ中の、まだ表示していない位置
         self.hw_decode = False       # 再生中のデコードをハードウェアで行っているか (load で決める)
+        self.live = None             # 表示中の映像入力 (player_live の SdiInput / CameraInput)。None なら動画ファイル
+        self.live_frozen = False     # 入力の表示を止めている (静止)
+        self.live_received = 0       # 統計の表示で、前回までに受け取ったコマ数
+        self.recorder = None         # 入力の録画 (player_live.Recorder)
         self.sdi = None              # SDI 出力 (player_sdi.SdiOutput)
         self.keep_running = KeepRunning()   # SDI 出力中は、裏に回っても OS に遅らせない
         self.sdi_sent_mark = 0       # 統計の表示で、前回までに送ったコマ数
@@ -160,7 +171,7 @@ class MainWindow(QMainWindow):
         self.hidden_paint = QTimer(self)          # 見えていない間に、画面の Hz の間隔で描く
         self.hidden_paint.setSingleShot(True)
         self.hidden_paint.setTimerType(Qt.PreciseTimer)
-        self.hidden_paint.timeout.connect(lambda: self.playing and self.view.render_soon())
+        self.hidden_paint.timeout.connect(lambda: (self.playing or self.live) and self.view.render_soon())
         self.last_swap = 0.0
         self.vsync = VsyncTimer()     # 書き換えの時刻 (揺れを除いたもの)
         self.swap_wall = None         # 直前の書き換えの推定時刻。再生中のコマはこの時刻を基準に選ぶ
@@ -221,6 +232,7 @@ class MainWindow(QMainWindow):
             return
         print(f"GPU 描画を使えないため CPU 描画に切り替えます: {reason}")
         self.pause()
+        self.show_input_file()             # 入力の表示は GPU 描画のときだけ
         self.stop_sdi()
         self.show_sdi_off()
         old = self.view_widget
@@ -245,6 +257,15 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         top = QHBoxLayout()
         top.addWidget(self._button("動画を開く", self.open_dialog))
+        top.addWidget(QLabel("入力"))
+        self.input_combo = SdiCombo()
+        self.input_combo.setFocusPolicy(Qt.NoFocus)
+        self.input_combo.setToolTip("動画ファイルの代わりに、カメラや Blackmagic の SDI 入力の映像を表示する")
+        self.input_combo.addItem("動画ファイル", None)
+        self.input_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.input_combo.refresh = self.refresh_inputs
+        self.input_combo.currentIndexChanged.connect(self.input_changed)
+        top.addWidget(self.input_combo)
         self.name_label = QLabel("")
         self.name_label.setObjectName("dim")
         top.addWidget(self.name_label, 1)
@@ -287,7 +308,10 @@ class MainWindow(QMainWindow):
         self.slider.sliderReleased.connect(self.slider_released)
         self.time_label = QLabel(fmt_time(0) + " / " + fmt_time(0))
         self.time_label.setObjectName("time")
-        for w in (self.play_btn, self.prev_btn, self.next_btn):
+        self.rec_btn = self._button("● 録画", self.toggle_recording, "入力の映像をファイルに録画する (R)")
+        self.rec_btn.setCheckable(True)
+        self.rec_btn.setVisible(False)
+        for w in (self.play_btn, self.prev_btn, self.next_btn, self.rec_btn):
             row1.addWidget(w)
         row1.addWidget(self.slider, 1)
         row1.addWidget(self.time_label)
@@ -347,9 +371,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def set_enabled(self, on):
-        for w in (self.play_btn, self.prev_btn, self.next_btn, self.slider, self.a_btn, self.b_btn):
-            w.setEnabled(on)
-        self.clear_btn.setEnabled(on and (self.point_a is not None or self.point_b is not None))
+        """動画ファイルの操作を使えるか。入力を表示している間は、再生ボタン (静止 / ライブ) 以外は使わない。"""
+        live = self.live is not None
+        self.play_btn.setEnabled(on or live)
+        for w in (self.prev_btn, self.next_btn, self.slider, self.a_btn, self.b_btn, self.loop_btn,
+                  self.fps_combo, self.speed_combo, self.hw_check):
+            w.setEnabled(on and not live)
+        self.clear_btn.setEnabled(on and not live and (self.point_a is not None or self.point_b is not None))
+        self.rec_btn.setVisible(live)
 
     def show_help(self):
         QMessageBox.information(self, "操作方法", HELP_TEXT)
@@ -434,6 +463,10 @@ class MainWindow(QMainWindow):
         動画の進む速さより低いと (120fps の動画を 60Hz の画面で出すなど) 画面には Hz の分しか出ない。"""
         if self.sdi is None:
             return
+        if self.live:
+            fps = self.live.fps
+            self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, fps) if fps and not self.live_frozen else None
+            return
         rate = min(self.fps() * self.speed(), self.hz) if self.src else 0.0
         self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, rate) if self.playing else None
 
@@ -484,6 +517,8 @@ class MainWindow(QMainWindow):
             self.load(urls[0].toLocalFile())
 
     def load(self, path):
+        if self.live:                 # 動画を開いたら入力の表示はやめる
+            self.show_input_file()
         self.pause()
         try:
             src = VideoSource(path)
@@ -721,6 +756,8 @@ class MainWindow(QMainWindow):
 
     # ---------- playback ----------
     def toggle_play(self):
+        if self.live:
+            return self.set_live_frozen(not self.live_frozen)
         if self.playing:
             self.pause()
         else:
@@ -832,6 +869,8 @@ class MainWindow(QMainWindow):
     # SDI 出力はこの間も描いて送る。
     def on_swapped(self):
         self.last_swap = time.perf_counter()
+        if self.live:
+            return self.live_tick()
         if self.playing:
             shown = self.view.isExposed()
             if shown != self.view_shown:            # 見える・見えないが変わった: 合わせ方を切り替える
@@ -865,7 +904,9 @@ class MainWindow(QMainWindow):
     def on_timer(self):
         if not isinstance(self.view, GpuWindow):
             return self.tick()
-        if self.playing and time.perf_counter() - self.last_swap > 0.05:
+        if self.live and self.live_frozen:
+            return self.record_latest()              # 静止中も、録画には入力のコマを渡し続ける
+        if (self.playing or self.live) and time.perf_counter() - self.last_swap > 0.05:
             self.view.render_soon()
 
     def update_lock(self):
@@ -995,6 +1036,8 @@ class MainWindow(QMainWindow):
         dt = self.stats_dt = now - self.stats_t0
         self.stats_t0 = now
         shown, self.view.painted = self.view.painted, 0
+        if self.live:
+            return self.live_stats(shown / dt)
         if not self.src:
             self.view.stats_text = ""
             return
@@ -1098,6 +1141,12 @@ class MainWindow(QMainWindow):
             Qt.Key_Backslash: self.clear_ab, Qt.Key_yen: self.clear_ab,   # 日本語キーボードの \ は ¥
             Qt.Key_F: self.toggle_fullscreen,
         }
+        if self.live:
+            # 入力を表示している間は、動画ファイルの操作 (シーク・コマ送り・ループ) は使わない
+            actions = {key: act for key, act in actions.items()
+                       if key in (Qt.Key_Space, Qt.Key_K, Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus, Qt.Key_0,
+                                  Qt.Key_Backspace, Qt.Key_F)}
+            actions[Qt.Key_R] = lambda: self.rec_btn.click()
         if k == Qt.Key_Escape:
             if self.isFullScreen():
                 self.toggle_fullscreen()
@@ -1111,6 +1160,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         self.arm_timer.stop()
         self.pause()
+        self.exit_live()
         self.stop_sdi()
         self.close_backfill()
         if self.src:

@@ -300,6 +300,19 @@ def plane_views(data, fmt, width, height):
     return views
 
 
+def fill_frame(frame, data, fmt, width, height):
+    """write_frame の逆: 詰めて並べた data (frame_size の形) を、PyAV のフレーム frame の各プレーンへ写す。"""
+    import numpy as np
+
+    bps = YUV_FORMATS[fmt][2]
+    offset = 0
+    for plane, (cols, rows) in zip(frame.planes, plane_sizes(fmt, width, height)):
+        row_bytes = cols * bps
+        dst = np.frombuffer(plane, np.uint8, count=plane.line_size * rows).reshape(rows, plane.line_size)
+        dst[:, :row_bytes] = data[offset:offset + row_bytes * rows].reshape(rows, row_bytes)
+        offset += row_bytes * rows
+
+
 def yuv_planes(data, fmt, width, height):
     """Y, U, V の 3 枚の 2 次元配列 (確認用)。色差を交互に並べた形式は Cb Cr に分け、10bit は下位に戻す。"""
     views = plane_views(data, fmt, width, height)
