@@ -6,10 +6,15 @@ MainWindow がこのクラスを受け継ぐ。再生の流れ (on_swapped / on_
 import os
 import time
 
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtCore import QCameraPermission, QSettings, Qt
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 import player_live
-from player_view import GpuWindow
+from player_core import YUV_FORMATS, yuv_samples
+from player_view import GpuWindow, white_balance
+
+WB_INTERVAL = 0.2     # 自動WB: 色の平均を測り直す間隔 (秒)
+WB_SMOOTH = 0.3       # 1 回にどれだけ新しい倍率へ寄せるか (急に色が変わってちらつかないように)
 
 
 def _fmt():
@@ -51,6 +56,29 @@ class LiveMixin:
         self.exit_live()
         if device is None:
             return self.show_file()
+        if device.kind == "camera":
+            return self.with_camera_permission(device)
+        self.open_live(device)
+
+    # macOS はカメラを使う前に許可が要る。許可されていないと、FFmpeg はダイアログも出さずにコマを待ち続け、
+    # 「信号なし」のままになる。カメラを開く前に確かめ、まだ聞いていなければ許可のダイアログを出す
+    def with_camera_permission(self, device):
+        app = QApplication.instance()
+        permission = QCameraPermission()
+        status = app.checkPermission(permission)
+        if status == Qt.PermissionStatus.Granted:
+            return self.open_live(device)
+        if status == Qt.PermissionStatus.Undetermined:
+            def answered(result):
+                if self.input_combo.currentData() is device:     # 待っている間に別の入力を選んでいなければ
+                    self.with_camera_permission(device)
+            app.requestPermission(permission, self, answered)
+            return
+        self.show_input_file()
+        QMessageBox.warning(self, "入力", "カメラの使用が許可されていません。\n"
+                            "システム設定 → プライバシーとセキュリティ → カメラ で、このアプリを許可してください。")
+
+    def open_live(self, device):
         try:
             source = device.open()
         except Exception as e:
@@ -71,6 +99,9 @@ class LiveMixin:
         self.name_label.setText(f"入力: {source.name}")
         self.view.picture = None
         self.view.placeholder = f"{source.name}\n映像を待っています…"
+        self.set_wb(None)
+        # カメラ (macOS が渡す NV12) も SDI も、BT.709 の限定範囲 (16〜235)。前に開いた動画の設定を残さない
+        self.set_view_color(True, False)
         self.set_enabled(bool(self.src))
         self.update_sdi_sequence()
         self.timer.start()
@@ -89,6 +120,7 @@ class LiveMixin:
         self.play_btn.setText("▶ 再生")
         self.play_btn.setToolTip("再生 / 一時停止 (Space)")
         self.view.placeholder = "動画ファイルをここにドロップ\nまたは「動画を開く」から選択"
+        self.set_wb(None)
         self.set_enabled(bool(self.src))
         self.update_sdi_sequence()
 
@@ -105,6 +137,7 @@ class LiveMixin:
         if self.src and self.cur_frame is not None:
             fmt_fps, _ = _fmt()
             self.name_label.setText(f"{self.path}   {self.src.width}×{self.src.height}  {fmt_fps(self.src.fps)} fps")
+            self.set_view_color(self.src.bt709, self.src.full_range)
             self.view.set_picture(self.cur_frame)
         else:
             self.name_label.setText("")
@@ -118,6 +151,8 @@ class LiveMixin:
             picture = self.live.latest()
             if picture is not None:
                 self.view.set_picture(picture)
+                if self.wb_check.isChecked():
+                    self.update_wb(picture)
                 if self.recorder:
                     self.recorder.push(picture)
             if shown:
@@ -181,6 +216,46 @@ class LiveMixin:
         else:
             QMessageBox.information(self, "録画", f"{recorder.path}\n{note}")
 
+    # ---------- 自動WB (ホワイトバランス) ----------
+    @staticmethod
+    def settings():
+        return QSettings("ZoomVideoPlayer", "ZoomVideoPlayer")
+
+    def wb_toggled(self, on):
+        self.settings().setValue("live/auto_wb", on)
+        self.set_wb(None)
+        self.view.update()
+
+    def set_view_color(self, bt709, full_range):
+        if isinstance(self.view, GpuWindow):          # CPU 描画は色の変換を PyAV に任せている
+            self.view.set_color(bt709, full_range)
+
+    def set_wb(self, wb):
+        self.wb_at = 0.0
+        if isinstance(self.view, GpuWindow):
+            self.view.wb = wb
+
+    def wb_label(self):
+        wb = getattr(self.view, "wb", None)
+        if not self.wb_check.isChecked() or not wb:
+            return ""
+        (r, _, b), (rk, _, bk) = wb
+        return f" ・ 自動WB R×{r:.2f}{rk:+.2f} B×{b:.2f}{bk:+.2f}"
+
+    def update_wb(self, picture):
+        """コマから補正 (色ごとの倍率とずれ) を求め、少しずつ寄せる (表示と SDI 出力に効く。録画には効かない)。"""
+        now = time.monotonic()
+        if not isinstance(self.view, GpuWindow) or picture.fmt not in YUV_FORMATS or now - self.wb_at < WB_INTERVAL:
+            return
+        self.wb_at = now
+        samples = yuv_samples(picture.fmt, picture.w, picture.h, picture.data)
+        target = white_balance(samples, self.view.bt709, self.view.full_range, YUV_FORMATS[picture.fmt][3])
+        if target is None:              # 明るさの幅が狭すぎて求められない (信号なしの黒など): 今のまま
+            return
+        old = self.view.wb or target
+        self.view.wb = tuple(tuple(o + WB_SMOOTH * (t - o) for o, t in zip(olds, news))
+                             for olds, news in zip(old, target))
+
     def live_stats(self, shown_fps):
         """入力を表示している間の、右上の統計。"""
         source = self.live
@@ -189,8 +264,12 @@ class LiveMixin:
         hz = self.hz = self.refresh_rate()
         state = "静止中" if self.live_frozen else f"表示 {shown_fps:.1f} fps"
         text = (f"入力 {source.status()} ・ 受け取り {got / max(self.stats_dt, 1e-3):.1f} fps ・ {state}\n"
-                f"画面 {round(hz)} Hz ・ {self.view.renderer}{self.sdi_label()}")
+                f"画面 {round(hz)} Hz ・ {self.view.renderer}{self.sdi_label()}{self.wb_label()}")
         warn = not source.signal or bool(source.error)
+        effects = getattr(source, "effects", None)
+        if effects:
+            text += f"\nmacOS のビデオエフェクト: {'・'.join(effects)} (コントロールセンターで切れます)"
+            warn = True
         if self.recorder:
             r = self.recorder
             _, fmt_time = _fmt()

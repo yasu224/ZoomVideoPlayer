@@ -270,6 +270,35 @@ def plane_sizes(fmt, width, height):
     return [(width, height), (width >> sx, height >> sy), (width >> sx, height >> sy)]
 
 
+def yuv_samples(fmt, width, height, data, count=16000):
+    """コマから間引いて取った画素の (Y, Cb, Cr) の並び (N×3、bits ビットの最大値を 1 とした 0〜1)。
+
+    解像度によらず count 個ほどになるよう、縦横同じ間隔 (偶数) で取り、その位置の Y と色差を組にする
+    (色差は縮んでいる分だけ間隔を詰めて読む)。4K でも 1080p と同じ手間で済む。
+    """
+    import math
+
+    import numpy as np
+    step = max(2, 2 * round(math.sqrt(width * height / count) / 2))
+
+    sx, sy, bps, _ = YUV_FORMATS[fmt]
+    values = data.view(np.uint16 if bps == 2 else np.uint8)
+    unit = (65535 if bps == 2 else 255) / texture_scale(fmt)     # 最大値を 1 にする割り算
+    planes, offset = [], 0
+    for cols, rows in plane_sizes(fmt, width, height):
+        planes.append(values[offset:offset + cols * rows].reshape(rows, cols))
+        offset += cols * rows
+    cx, cy = max(1, step >> sx), max(1, step >> sy)
+    if fmt in SEMI:      # Cb と Cr が交互に並ぶ
+        cb, cr = planes[1][::cy, 0::2][:, ::cx], planes[1][::cy, 1::2][:, ::cx]
+    else:
+        cb, cr = planes[1][::cy, ::cx], planes[2][::cy, ::cx]
+    y = planes[0][::step, ::step]
+    h, w = (min(a.shape[0] for a in (y, cb, cr)), min(a.shape[1] for a in (y, cb, cr)))
+    out = np.stack([y[:h, :w], cb[:h, :w], cr[:h, :w]], -1).reshape(-1, 3)
+    return out.astype(np.float32) / np.float32(unit)
+
+
 def frame_size(fmt, width, height):
     """フレームを置く配列の形。YUV は 3 プレーンを詰めて並べた 1 次元のバイト列。"""
     if fmt == "bgra":
@@ -376,9 +405,11 @@ class _CountedQueue:
         self.sent.value += 1
 
 
-def attach_shared_memory(name):
-    """画面側が作った共有メモリを開く。片付けは作った側 (画面側) が行う。
+def attach_shared_memory(name=None, create_size=0):
+    """共有メモリを、後始末の登録をせずに開く (create_size を渡すと作る)。片付けは呼んだ側が自分で行う。
 
+    画面側が作った共有メモリを子プロセスが開くとき (name)、子プロセスが作って画面側と受け渡すとき
+    (create_size、カメラの入力) に使う。
     macOS / Linux では、開いただけの子プロセスも後始末の対象として登録され、終了時に
     「片付け忘れ」の警告が出たり、先に消されたりする。その登録をしないようにする。
     子プロセスは画面側と同じ後始末係 (resource_tracker) を共有しているので、開いたあとで
@@ -389,10 +420,15 @@ def attach_shared_memory(name):
     import sys
     from multiprocessing import shared_memory
 
+    def open_shm(**extra):
+        if create_size:
+            return shared_memory.SharedMemory(create=True, size=create_size, **extra)
+        return shared_memory.SharedMemory(name=name, **extra)
+
     if os.name != "posix":                 # Windows は後始末の登録をしない (OS が片付ける)
-        return shared_memory.SharedMemory(name=name)
+        return open_shm()
     if sys.version_info >= (3, 13):
-        return shared_memory.SharedMemory(name=name, track=False)
+        return open_shm(track=False)
     from multiprocessing import resource_tracker
     register = resource_tracker.register
 
@@ -402,9 +438,27 @@ def attach_shared_memory(name):
 
     resource_tracker.register = register_except_shm
     try:
-        return shared_memory.SharedMemory(name=name)
+        return open_shm()
     finally:
         resource_tracker.register = register
+
+
+def unlink_shared_memory(shm):
+    """attach_shared_memory で作った (後始末の登録をしていない) 共有メモリを消す。
+
+    標準の unlink() は後始末の登録も外そうとするので、登録していないものに使うと KeyError の警告が出る。
+    """
+    import os
+    import sys
+    if os.name != "posix":                 # Windows は、すべて閉じれば OS が消す
+        return
+    if sys.version_info >= (3, 13):
+        return shm.unlink()
+    import _posixshmem
+    try:
+        _posixshmem.shm_unlink(shm._name)
+    except FileNotFoundError:
+        pass
 
 
 def decode_worker(path, fmt, shm_name, slots, cmd_q, ready_q, free_q, clock_values, decoded, sent, started,
