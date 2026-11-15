@@ -463,9 +463,9 @@ class MainWindow(LiveMixin, QMainWindow):
         動画の進む速さより低いと (120fps の動画を 60Hz の画面で出すなど) 画面には Hz の分しか出ない。"""
         if self.sdi is None:
             return
-        if self.live:
-            fps = self.live.fps
-            self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, fps) if fps and not self.live_frozen else None
+        if self.live:                 # 入力も同じく、画面に新しいコマが出る速さで比べる
+            rate = min(self.live.fps, self.hz)
+            self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, rate) if rate and not self.live_frozen else None
             return
         rate = min(self.fps() * self.speed(), self.hz) if self.src else 0.0
         self.sdi.sequence = player_sdi.sequence_for(self.sdi.mode.fps, rate) if self.playing else None
