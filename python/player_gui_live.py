@@ -4,13 +4,13 @@ MainWindow がこのクラスを受け継ぐ。再生の流れ (on_swapped / on_
 入力を表示している間だけ呼ばれる。入力そのもの (機器とのやり取り・録画の書き出し) は player_live。
 """
 import os
-import sys
 import time
 
 from PySide6.QtCore import QCameraPermission, QSettings, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 import player_capture as capture
+from player_os import IS_WIN
 import player_live
 from player_core import YUV_FORMATS, yuv_samples
 from player_view import GpuWindow, white_balance
@@ -80,7 +80,7 @@ class LiveMixin:
             return
         self.show_input_file()
         where = ("設定 → プライバシーとセキュリティ → カメラ で、デスクトップ アプリがカメラを使えるようにしてください。"
-                 if sys.platform == "win32" else
+                 if IS_WIN else
                  "システム設定 → プライバシーとセキュリティ → カメラ で、このアプリを許可してください。")
         QMessageBox.warning(self, "入力", f"カメラの使用が許可されていません。\n{where}")
 

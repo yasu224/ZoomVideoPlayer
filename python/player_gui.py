@@ -6,7 +6,7 @@ PySide6 で画面を作り、PyAV (FFmpeg) で動画をデコードする。モ�
 - player_view.py   表示 (拡大縮小・ミニマップ、CPU 描画 / GPU 描画、SDI 出力用の描画)
 - player_vsync.py  画面の書き換え (垂直同期) に合わせたコマの選び方
 - player_sdi.py    Blackmagic の SDI 出力 (機器の一覧、送るスレッド)
-- player_os.py     OS ごとの違いがある処理 (スレッドの優先度、裏に回ったときの遅れ)
+- player_os.py     OS ごとの違いがある処理 (OS の判定、スレッドの優先度、裏に回ったときの遅れ、Objective-C の呼び出し)
 - player_live.py   映像入力 (カメラ・SDI 入力) と録画
 - player_gui_live.py  メインウィンドウの映像入力の部分 (LiveMixin)
 - player_gui.py    このファイル
@@ -14,14 +14,13 @@ PySide6 で画面を作り、PyAV (FFmpeg) で動画をデコードする。モ�
 起動は zoom_player.py から行う。
 """
 import queue
-import sys
 import time
 
 from player_core import END_OF_FILE, WRAP, VideoSource, even_size, gpu_format, probe_hw
 from player_frames import BackFiller, Decoder, FrameCache, make_picture
 import player_sdi
 from player_gui_live import LiveMixin
-from player_os import KeepRunning, raise_ui_thread_priority
+from player_os import IS_MAC, KeepRunning, raise_ui_thread_priority
 from player_view import CpuView, GpuWindow, gpu_wanted
 from player_vsync import VsyncLock, VsyncTimer, vsync_lock_step
 from PySide6.QtCore import QRectF, Qt, QTimer
@@ -39,7 +38,7 @@ SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2, 4]
 HW_FPS_MARGIN = 1.15
 # 時刻表示の等幅フォント。その OS にないフォント名を先に書くと、Qt が代わりを探すのに
 # 起動時 0.1 秒ほどかかるので、OS ごとにある名前だけを書く。
-MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
+MONO_FONT = "Menlo" if IS_MAC else "Consolas"
 STYLE = """
     QMainWindow, QWidget { background:#111317; color:#e6e8eb; }
     QWidget#bar { background:#1b1e24; }
@@ -76,7 +75,7 @@ Space / K\t静止 / ライブ (止めている間も拡大できる)
 R\t録画の開始 / 停止
 
 ※ 音声は再生も録画もしません (映像の確認用)。"""
-if sys.platform == "darwin":
+if IS_MAC:
     HELP_TEXT = HELP_TEXT.replace("Ctrl+ドラッグ", "⌘+ドラッグ (control+ドラッグ)")
 
 
@@ -906,7 +905,7 @@ class MainWindow(LiveMixin, QMainWindow):
             lock = self.lock
             if lock and lock.t is not None and clock.started:
                 # 画面に合わせる: 書き換え 1 回分ちょうど進め、共有の時計 (デコード側も見る) もそこへ揃える
-                clock.set(lock.advance(self.swap_wall), self.swap_wall, self.speed())
+                clock.set(lock.advance(self.swap_wall), self.swap_wall, lock.speed)     # = self.speed() (変われば lock を作り直す)
             self.tick()
             if clock.started:
                 t = clock.at(self.swap_wall)

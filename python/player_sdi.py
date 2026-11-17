@@ -25,7 +25,11 @@ import threading
 
 import numpy as np
 
-LIB_NAMES = {"darwin": ("libzvp_decklink.dylib", "build_sdi_mac.sh"), "win32": ("zvp_decklink.dll", "build_sdi.bat")}
+from player_os import IS_MAC, IS_WIN
+
+# ライブラリのファイル名と、それを作るスクリプト (この OS 用。対応していない OS は None)
+LIB_NAME = (("libzvp_decklink.dylib", "build_sdi_mac.sh") if IS_MAC else
+            ("zvp_decklink.dll", "build_sdi.bat") if IS_WIN else None)
 SEQUENCE = -2         # 送るときの印: 前に予約した絵のすぐ後ろへ順番に並べる (動画と出力の fps が整数倍のとき)
 MAX_PENDING = 4       # 送る前の絵をいくつまで貯めるか (超えたら古いものを捨てる)
 
@@ -79,10 +83,10 @@ def load_library():
     global _lib, _lib_error
     if _lib is not None or _lib_error is not None:
         return _lib
-    if sys.platform not in LIB_NAMES:
+    if LIB_NAME is None:
         _lib_error = "SDI 出力は macOS と Windows だけに対応しています"
         return None
-    name, script = LIB_NAMES[sys.platform]
+    name, script = LIB_NAME
     path = next((p for p in _lib_paths(name) if os.path.exists(p)), None)
     if path is None:
         _lib_error = f"SDI 出力用のライブラリがありません ({script} でビルドしてください)"
@@ -165,6 +169,9 @@ class SdiOutput:
         # 出力の n コマ分続けて順番に並べる。それ以外 (停止中など) は None で、機器のコマごとに描く
         self.sequence = None
         self._handle = None
+        # clock() の受け取り先 (画面の書き換えのたびに読むので作り置く)
+        self._clock_out = (ctypes.c_int64(), ctypes.c_double())
+        self._clock_refs = tuple(map(ctypes.byref, self._clock_out))
         self._pending = []            # 送る前の絵 (_Picture)。古い順
         self._cond = threading.Condition()
         self._quit = False
@@ -215,8 +222,8 @@ class SdiOutput:
         """機器の出力のクロック: (いま出しているコマの番号, そのコマの中の位置 0〜1)。読めなければ None。"""
         if not self._handle:
             return None
-        frame, phase = ctypes.c_int64(), ctypes.c_double()
-        if _lib.zvp_dl_clock(self._handle, ctypes.byref(frame), ctypes.byref(phase)) != 0:
+        frame, phase = self._clock_out
+        if _lib.zvp_dl_clock(self._handle, *self._clock_refs) != 0:
             return None
         return frame.value, phase.value
 

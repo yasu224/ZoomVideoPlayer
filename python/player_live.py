@@ -7,6 +7,7 @@
 - カメラ: FFmpeg (macOS は AVFoundation、Windows は DirectShow) から NV12 で受け取る (別プロセス: player_capture)
 どちらも画面 (GPU) がそのまま読める形式で、録画 (HEVC) にもそのまま渡せる。
 """
+import collections
 import ctypes
 import queue
 import threading
@@ -119,6 +120,9 @@ class SdiInput:
                                                         ctypes.c_int32())
         self._dur, self._scale, self._no, self._t = ctypes.c_int64(), ctypes.c_int64(), ctypes.c_int64(), ctypes.c_double()
         self._name, self._err = ctypes.create_string_buffer(64), ctypes.create_string_buffer(128)
+        self._format_refs = tuple(map(ctypes.byref, (self._w, self._h, self._dur, self._scale)))
+        self._format_refs2 = tuple(map(ctypes.byref, (self._serial, self._signal)))
+        self._latest_refs = (ctypes.byref(self._no), ctypes.byref(self._t))
 
     def open(self):
         lib = _sdi_lib()
@@ -135,8 +139,7 @@ class SdiInput:
         lib = _sdi_lib()
         w, h, dur, scale, serial, signal = self._w, self._h, self._dur, self._scale, self._serial, self._signal
         name, err = self._name, self._err
-        lib.zvp_in_format(self.handle, ctypes.byref(w), ctypes.byref(h), ctypes.byref(dur), ctypes.byref(scale),
-                          name, 64, ctypes.byref(serial), ctypes.byref(signal), err, 128)
+        lib.zvp_in_format(self.handle, *self._format_refs, name, 64, *self._format_refs2, err, 128)
         self.signal = bool(signal.value)
         self.error = err.value.decode("utf-8", "replace") if err.value else ""
         if serial.value == self.serial and (w.value, h.value) == self.size:
@@ -156,7 +159,7 @@ class SdiInput:
         """前に返したものより新しいコマがあれば Picture、無ければ None。"""
         self._check_format()
         no, t = self._no, self._t
-        idx = _sdi_lib().zvp_in_latest(self.handle, self.last_no, ctypes.byref(no), ctypes.byref(t))
+        idx = _sdi_lib().zvp_in_latest(self.handle, self.last_no, *self._latest_refs)
         if idx < 0 or idx >= len(self.bufs):
             return None
         self.last_no = no.value
@@ -381,6 +384,8 @@ class Recorder:
         self.dropped = 0
         self.error = None
         self.started_at = time.perf_counter()
+        # 写しに使うバッファの使い回し (4K 10bit では 1 コマ 16MB あり、毎コマ確保すると遅いため)
+        self._free = collections.deque()
         self._queue = queue.Queue(maxsize=max(4, int(float(rate) * self.QUEUE_SECONDS)))
         self._thread = threading.Thread(target=self._run, name="recorder", daemon=True)
         self._thread.start()
@@ -391,8 +396,14 @@ class Recorder:
             self.dropped += 1
             return
         try:
-            self._queue.put_nowait(picture.data.copy())
+            buf = self._free.pop()
+        except IndexError:
+            buf = np.empty_like(picture.data)
+        np.copyto(buf, picture.data)
+        try:
+            self._queue.put_nowait(buf)
         except queue.Full:
+            self._free.append(buf)
             self.dropped += 1
 
     def _run(self):
@@ -404,6 +415,7 @@ class Recorder:
                     break
                 frame = av.VideoFrame(self.width, self.height, self.fmt)
                 fill_frame(frame, data, self.fmt, self.width, self.height)
+                self._free.append(data)          # 写し終えたので次のコマに使い回す
                 if self.pix != self.fmt:
                     frame = frame.reformat(format=self.pix)
                 frame.pts = self.written

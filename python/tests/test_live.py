@@ -25,6 +25,33 @@ class CameraModeTest(unittest.TestCase):
         self.assertEqual(player_capture.best_mode(modes), (1280, 720, 59.94))
         self.assertIsNone(player_capture.best_mode([]))
 
+    def test_windows_device_names(self):
+        """Windows (DirectShow) の機器一覧を、FFmpeg の古い書き方でも新しい書き方でも読める。"""
+        new = [
+            '"Live Gamer ULTRA S GC553Pro"', ' (video', ')', '',
+            '  Alternative name "@device_pnp_\\\\?\\usb#vid_07ca&pid_1553"',
+            '"Streaming Center Virtual Camera" (video)',
+            '  Alternative name "@device_sw_{860BB310}"',
+            '"HDMI (Live Gamer ULTRA S GC553Pro)"', ' (audio', ')', '',
+            '"Both" (video, audio)',
+            '"Nothing" (none)',
+        ]
+        self.assertEqual(player_capture.parse_device_names(new, "dshow"),
+                         ["Live Gamer ULTRA S GC553Pro", "Streaming Center Virtual Camera", "Both"])
+        old = [
+            'DirectShow video devices (some may be both video and audio devices)',
+            ' "USB Camera"',
+            '    Alternative name "@device_pnp_x"',
+            'DirectShow audio devices',
+            ' "Microphone"',
+        ]
+        old = [line.strip() if '"' in line and "Alternative" not in line else line for line in old]
+        self.assertEqual(player_capture.parse_device_names(old, "dshow"), ["USB Camera"])
+        mac = ['AVFoundation video devices:', '[0] FaceTime HD Camera', '[1] Capture screen 0',
+               'AVFoundation audio devices:', '[0] MacBook Pro Microphone']
+        self.assertEqual(player_capture.parse_device_names(mac, "avfoundation"),
+                         ["FaceTime HD Camera", "Capture screen 0"])
+
     def test_windows_modes(self):
         """Windows (DirectShow) の一覧から形式も選ぶ。同じ大きさと fps なら圧縮していない形式を選ぶ。"""
         lines = [
