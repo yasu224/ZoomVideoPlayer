@@ -79,6 +79,20 @@ def raise_ui_thread_priority():
     kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
 
 
+def set_app_id(app_id):
+    """Windows: タスクバーでこのアプリ自身のアイコンを使うよう、アプリの ID を付ける。
+
+    付けないと、python で起動したとき (run.bat) はタスクバーに Python のアイコンが出る。
+    """
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        ctypes.WinDLL("shell32").SetCurrentProcessExplicitAppUserModelID(ctypes.c_wchar_p(app_id))
+    except (OSError, AttributeError):
+        pass
+
+
 class KeepRunning:
     """見えていない (最小化・ほかのウィンドウの後ろ) 間も、タイマーを遅らせずに動かしてもらう。
 

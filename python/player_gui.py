@@ -90,6 +90,24 @@ def fmt_fps(f):
     return f"{f:.3f}".rstrip("0").rstrip(".")
 
 
+class LogoMark(QWidget):
+    """操作パネルの右端に置く MARY のロゴ。画面の拡大率が変わってもぼやけないよう、毎回 SVG から描く。"""
+
+    HEIGHT = 13
+
+    def __init__(self):
+        super().__init__()
+        from player_brand import aspect
+        self.setFixedSize(round(self.HEIGHT * aspect()) + 4, self.HEIGHT + 4)
+        self.setToolTip("MARY")
+
+    def paintEvent(self, e):
+        from player_brand import draw_logo
+        p = QPainter(self)
+        draw_logo(p, QRectF(2, 2, self.width() - 4, self.HEIGHT), "#c9ced6")
+        p.end()
+
+
 class SdiCombo(QComboBox):
     """開くたびに中身を読み直すメニュー (SDI 出力、入力。後からつないだ機器も出るように)。"""
 
@@ -303,6 +321,8 @@ class MainWindow(LiveMixin, QMainWindow):
         self.sdi_combo.currentIndexChanged.connect(self.sdi_changed)
         top.addWidget(self.sdi_combo)
         top.addWidget(self._button("操作方法", self.show_help))
+        top.addSpacing(10)
+        top.addWidget(LogoMark())
 
         row1 = QHBoxLayout()
         self.play_btn = self._button("▶ 再生", self.toggle_play, "再生 / 一時停止 (Space)")

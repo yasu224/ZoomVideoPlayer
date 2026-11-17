@@ -226,8 +226,15 @@ class ViewBase:
 
     # ---------- overlays ----------
     def draw_placeholder(self, p):
+        """動画を開く前の画面: 真ん中に MARY のロゴ (控えめな色) と、開き方の案内。"""
+        from player_brand import draw_logo
+        area = self.area()
+        logo_h = max(20.0, min(56.0, area.height() * 0.08))
+        logo = QRectF(area.left(), area.center().y() - logo_h * 1.9, area.width(), logo_h)
+        draw_logo(p, logo, "#3a414c")
         p.setPen(QColor("#9aa1ab"))
-        p.drawText(self.area(), Qt.AlignCenter, self.placeholder)
+        p.drawText(QRectF(area.left(), logo.bottom() + logo_h * 0.6, area.width(), area.height()),
+                   Qt.AlignHCenter | Qt.AlignTop, self.placeholder)
 
     def draw_overlays(self, p, mini):
         """選択枠・倍率・統計・ミニマップの枠と影 (ミニマップの絵は各ビューが先に描く)。"""

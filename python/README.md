@@ -139,6 +139,8 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `player_frames.py` | 画面側のフレーム、停止中のコマの記憶、デコードプロセスとの受け渡し |
 | `player_core.py` | デコード（PyAV）。再生中は別プロセスで動く |
 | `player_vsync.py` | 画面の書き換え（垂直同期）に合わせたコマの選び方 |
+| `player_brand.py`, `assets/mary.svg` | MARY のロゴ（操作パネルの右端と、動画を開く前の画面）とアプリのアイコンの絵 |
+| `assets/mary.ico`, `assets/mary.icns` | exe / .app のアイコン（`tools/make_icon.py` で作り直す） |
 | `player_live.py` | 映像入力（SDI 入力・カメラ）と録画 |
 | `player_capture.py` | カメラから読む側（別プロセス。Qt を読み込まない） |
 | `player_gui_live.py` | メインウィンドウの映像入力の部分（入力の選択、表示、静止、録画、統計） |
@@ -149,6 +151,7 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `tests/`, `run_tests.py`, `run_tests.bat`, `run_tests.sh` | 自動テスト |
 | `tools/check_gpu.py` | 本物の画面での GPU 描画の確認 |
 | `tools/check_realtime.py` | 本物の画面での再生のリアルタイム性の測定 |
+| `tools/make_icon.py` | ロゴからアイコンのファイル（.ico / .icns）を作る |
 | `run.bat` / `run_mac.sh` | 起動用（初回セットアップ込み） |
 | `build.bat` / `build_mac.sh` / `ZoomVideoPlayer.spec` | 配布用のビルド（exe / .app） |
 | `requirements.txt` | 必要なパッケージ |

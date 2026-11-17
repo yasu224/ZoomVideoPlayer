@@ -31,8 +31,12 @@ def main():
                 return True
             return super().event(e)
 
+    from player_brand import app_icon
+    from player_os import set_app_id
+    set_app_id("MARY.ZoomVideoPlayer")
     app = App(sys.argv)
     app.setApplicationName("Zoom Video Player")
+    app.setWindowIcon(app_icon())
     win = MainWindow()
     app.window = win
     win.show()

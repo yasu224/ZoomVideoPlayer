@@ -41,6 +41,8 @@ a = Analysis(
     ["zoom_player.py"],
     pathex=["."],
     binaries=SDI_BINARIES,
+    # MARY のロゴ (画面に描く)。アイコンのファイルは下の EXE / BUNDLE で使う
+    datas=[(os.path.join("assets", "mary.svg"), "assets")],
     excludes=["tkinter", "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick"],
     # GPU 描画 (PyOpenGL) は関数内で読み込むので明示する
     hiddenimports=["OpenGL.GL", "OpenGL.GL.shaders", "OpenGL.arrays.numpymodule",
@@ -59,6 +61,7 @@ exe = EXE(
     name="ZoomVideoPlayer",
     console=False,
     upx=False,
+    icon=os.path.join("assets", "mary.ico"),     # tools/make_icon.py で作ったもの
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="ZoomVideoPlayer", upx=False)
 
@@ -66,6 +69,7 @@ if MAC:
     app = BUNDLE(
         coll,
         name="ZoomVideoPlayer.app",
+        icon=os.path.join("assets", "mary.icns"),
         bundle_identifier="local.zoomvideoplayer",
         info_plist={
             "CFBundleName": "Zoom Video Player",
