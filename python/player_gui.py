@@ -266,6 +266,14 @@ class MainWindow(LiveMixin, QMainWindow):
         self.input_combo.refresh = self.refresh_inputs
         self.input_combo.currentIndexChanged.connect(self.input_changed)
         top.addWidget(self.input_combo)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setFocusPolicy(Qt.NoFocus)
+        self.mode_combo.setToolTip("カメラ (HDMI キャプチャー機器など) から受け取る解像度と fps。\n"
+                                   "「自動」は 1080p の 60fps 前後、無ければいちばん大きい形式。選んだ形式は機器ごとに覚える")
+        self.mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.mode_combo.setVisible(False)
+        self.mode_combo.currentIndexChanged.connect(self.camera_mode_changed)
+        top.addWidget(self.mode_combo)
         self.name_label = QLabel("")
         self.name_label.setObjectName("dim")
         top.addWidget(self.name_label, 1)
@@ -388,6 +396,7 @@ class MainWindow(LiveMixin, QMainWindow):
         self.rec_btn.setVisible(live)
         self.wb_check.setVisible(live)
         self.wb_check.setEnabled(isinstance(self.view, GpuWindow))
+        self.mode_combo.setVisible(live and self.live.device.kind == "camera")
 
     def show_help(self):
         QMessageBox.information(self, "操作方法", HELP_TEXT)
