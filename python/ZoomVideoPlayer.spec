@@ -3,9 +3,13 @@
 # 配布サイズと起動時間を減らしている。Qt の OpenGL 部品は GPU 描画で使うので残す。
 # GPU の OpenGL が使えない PC では、アプリが自動で CPU 描画に切り替える。
 # macOS では ZoomVideoPlayer.app を作る (Finder の「このアプリケーションで開く」にも対応)。
+import os
 import sys
 
 MAC = sys.platform == "darwin"
+# 環境変数 ZVP_ONEFILE=1 (build_onefile.bat) なら、exe 1 本にまとめる (dist\ZoomVideoPlayer.exe)。
+# 起動のたびに中身を一時フォルダへ展開するので、フォルダ形式より起動が数秒遅い。macOS は .app のまま
+ONEFILE = os.environ.get("ZVP_ONEFILE") == "1" and not MAC
 
 # 名前に含まれていたら外すファイル (パスは小文字・/ 区切りで比較する)。
 # Windows は Qt6Quick.dll など、macOS は QtQuick.framework など
@@ -31,8 +35,6 @@ def keep(entry):
     return not any(d in name for d in DROP)
 
 
-import os
-
 # SDI 出力用のライブラリ (build_sdi_mac.sh / build_sdi.bat で作ったもの) があれば一緒に入れる
 SDI_LIB = os.path.join("sdi", "libzvp_decklink.dylib" if MAC else "zvp_decklink.dll")
 SDI_BINARIES = [(SDI_LIB, "sdi")] if os.path.exists(SDI_LIB) else []
@@ -53,17 +55,14 @@ a.binaries = [b for b in a.binaries if keep(b)]
 a.datas = [d for d in a.datas if keep(d)]
 
 pyz = PYZ(a.pure)
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="ZoomVideoPlayer",
-    console=False,
-    upx=False,
-    icon=os.path.join("assets", "mary.ico"),     # tools/make_icon.py で作ったもの
-)
-coll = COLLECT(exe, a.binaries, a.datas, name="ZoomVideoPlayer", upx=False)
+ICON = os.path.join("assets", "mary.ico")         # tools/make_icon.py で作ったもの
+if ONEFILE:
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="ZoomVideoPlayer",
+              console=False, upx=False, icon=ICON)
+else:
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="ZoomVideoPlayer",
+              console=False, upx=False, icon=ICON)
+    coll = COLLECT(exe, a.binaries, a.datas, name="ZoomVideoPlayer", upx=False)
 
 if MAC:
     app = BUNDLE(

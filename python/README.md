@@ -92,6 +92,9 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 
 - Windows: `build.bat` で `dist\ZoomVideoPlayer\ZoomVideoPlayer.exe` ができます（PyInstaller、フォルダ形式）。
   配るときは `dist\ZoomVideoPlayer` フォルダごと渡してください（約 165MB、Python のインストール不要）。
+- Windows で exe 1 本にしたいときは `build_onefile.bat` で `dist\ZoomVideoPlayer.exe` ができます（約 65MB、
+  ファイル 1 つで渡せる）。起動のたびに中身を一時フォルダへ展開するので、フォルダ形式より起動が 6〜8 秒ほど
+  遅くなります（初回はウイルス対策の検査でさらに遅いことがあります）。一時フォルダは終了時に消えます。
 - macOS: Mac の上で `bash build_mac.sh` を実行すると `dist/ZoomVideoPlayer.app` ができます
   （PyInstaller はその OS 用のものしか作れないので、Windows では作れません）。
   Finder で動画を右クリック →「このアプリケーションで開く」や、Dock のアイコンへのドロップでも開けます。

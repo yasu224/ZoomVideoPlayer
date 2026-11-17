@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
-rem Zoom Video Player をビルドする。出来上がりは dist\ZoomVideoPlayer\ZoomVideoPlayer.exe
+rem Zoom Video Player をビルドする。出来上がりは dist\ZoomVideoPlayer\ZoomVideoPlayer.exe (フォルダ形式)。
+rem exe 1 本にするときは build_onefile.bat を使う (出来上がりは dist\ZoomVideoPlayer.exe)
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
   python -m venv .venv || goto :error
@@ -11,7 +12,11 @@ rem フォルダ付きで呼ぶ (NoDefaultCurrentDirectoryInExePath が設定さ
 call "%~dp0build_sdi.bat" || echo SDI 出力なしでビルドします
 ".venv\Scripts\pyinstaller.exe" --noconfirm --clean --distpath dist --workpath build ZoomVideoPlayer.spec || goto :error
 echo.
-echo ビルド完了: %~dp0dist\ZoomVideoPlayer\ZoomVideoPlayer.exe
+if "%ZVP_ONEFILE%"=="1" (
+  echo ビルド完了: %~dp0dist\ZoomVideoPlayer.exe
+) else (
+  echo ビルド完了: %~dp0dist\ZoomVideoPlayer\ZoomVideoPlayer.exe
+)
 exit /b 0
 :error
 echo ビルドに失敗しました。
