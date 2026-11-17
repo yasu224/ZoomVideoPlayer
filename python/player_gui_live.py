@@ -10,6 +10,7 @@ import time
 from PySide6.QtCore import QCameraPermission, QSettings, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+import player_capture as capture
 import player_live
 from player_core import YUV_FORMATS, yuv_samples
 from player_view import GpuWindow, white_balance
@@ -38,9 +39,10 @@ class LiveMixin:
         combo.addItem("動画ファイル", None)
         keep = 0
         for d in devices:
-            combo.addItem(d.label(), d)
             if d.same(current):
-                keep = combo.count() - 1
+                d = current                   # 読んだ形式の一覧と選んだ形式を持っているので、同じものを使い続ける
+                keep = combo.count()
+            combo.addItem(d.label(), d)
         if note:
             combo.addItem(note, None)
             combo.model().item(combo.count() - 1).setEnabled(False)
@@ -84,12 +86,56 @@ class LiveMixin:
 
     def open_live(self, device):
         try:
+            if device.kind == "camera" and device.modes is None:
+                self.restore_camera_mode(device)
             source = device.open()
         except Exception as e:
             self.show_input_file()
             QMessageBox.warning(self, "入力", f"{device.label()} を開けません。\n{e}")
             return
         self.enter_live(source)
+
+    # ---------- カメラの形式 (解像度・fps) ----------
+    @staticmethod
+    def camera_mode_setting(device):
+        return "live/camera_mode/" + device.name.replace("/", "_").replace("\\", "_")
+
+    def restore_camera_mode(self, device):
+        """カメラの使える形式を読み、前に選んだ形式があればそれを使う (無ければ自動)。"""
+        modes = device.load_modes()
+        saved = self.settings().value(self.camera_mode_setting(device), "", type=str)
+        device.mode = next((m for m in modes if capture.mode_key(m) == saved), None)
+
+    def fill_camera_modes(self, device):
+        """形式のメニューを、そのカメラの形式で作り直す。"""
+        combo = self.mode_combo
+        combo.blockSignals(True)
+        combo.clear()
+        modes = device.modes or []
+        best = capture.best_mode(modes)
+        combo.addItem(f"自動 ({capture.mode_label(best)})" if best else "自動", None)
+        for i, m in enumerate(modes):         # 番号で持つ (Qt に渡すとタプルがリストに変わるため)
+            combo.addItem(capture.mode_label(m), i)
+            if m == device.mode:
+                combo.setCurrentIndex(combo.count() - 1)
+        combo.setEnabled(bool(modes))
+        combo.blockSignals(False)
+
+    def camera_mode_changed(self):
+        """形式を選び直した: 覚えておき、その形式でカメラを開き直す。"""
+        source = self.live
+        if source is None or source.device.kind != "camera":
+            return
+        device = source.device
+        index = self.mode_combo.currentData()
+        device.mode = None if index is None else device.modes[index]
+        settings = self.settings()
+        if device.mode is None:
+            settings.remove(self.camera_mode_setting(device))
+        else:
+            settings.setValue(self.camera_mode_setting(device), capture.mode_key(device.mode))
+        self.exit_live()
+        self.open_live(device)
 
     def enter_live(self, source):
         """入力の表示を始める。動画ファイルの再生は止め、書き換えのたびに新しいコマを出す。"""
@@ -106,6 +152,8 @@ class LiveMixin:
         self.set_wb(None)
         # カメラ (macOS が渡す NV12) も SDI も、BT.709 の限定範囲 (16〜235)。前に開いた動画の設定を残さない
         self.set_view_color(True, False)
+        if source.device.kind == "camera":
+            self.fill_camera_modes(source.device)
         self.set_enabled(bool(self.src))
         self.update_sdi_sequence()
         self.timer.start()

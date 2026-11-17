@@ -44,6 +44,37 @@ class CameraModeTest(unittest.TestCase):
         self.assertEqual(player_capture.best_mode(same), (1280, 720, 60.0, ("pixel_format", "nv12")))
 
 
+    def test_mode_label_and_key(self):
+        """形式のメニューの文字と、設定に残す文字。"""
+        mac = (1920, 1080, 59.94)
+        win = (1920, 1080, 120.0, ("pixel_format", "yuyv422"))
+        self.assertEqual(player_capture.mode_label(mac), "1920×1080 59.94fps")
+        self.assertEqual(player_capture.mode_label(win), "1920×1080 120.00fps (yuyv422)")
+        self.assertEqual(player_capture.mode_key(mac), "1920x1080@59.9400")
+        self.assertEqual(player_capture.mode_key(win), "1920x1080@120.0000@pixel_format=yuyv422")
+        self.assertNotEqual(player_capture.mode_key(win),
+                            player_capture.mode_key((1920, 1080, 120.0, ("vcodec", "mjpeg"))))
+
+    def test_chosen_mode_is_used(self):
+        """形式を選んでいれば、自動で選ばずにその形式でカメラを開く。"""
+        opened = []
+
+        class FakeAv:
+            @staticmethod
+            def open(url, format=None, options=None, timeout=None):
+                opened.append(options)
+        real_modes, real_av = player_capture.camera_modes, sys.modules["av"]
+        player_capture.camera_modes = lambda index, name: [(1920, 1080, 60.0), (1920, 1080, 120.0)]
+        sys.modules["av"] = FakeAv
+        try:
+            player_capture.open_camera(0, "cam")
+            player_capture.open_camera(0, "cam", (1920, 1080, 120.0))
+        finally:
+            player_capture.camera_modes, sys.modules["av"] = real_modes, real_av
+        self.assertEqual((opened[0]["video_size"], opened[0]["framerate"]), ("1920x1080", "60"))
+        self.assertEqual((opened[1]["video_size"], opened[1]["framerate"]), ("1920x1080", "120"))
+
+
 class CameraCaptureTest(unittest.TestCase):
     """カメラを読む側 (別プロセスで動く player_capture.CameraCapture) を、作り物のカメラで同じプロセスの中で動かす。"""
 

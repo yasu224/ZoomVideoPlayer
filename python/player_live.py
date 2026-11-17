@@ -29,6 +29,14 @@ class LiveDevice:
 
     def __init__(self, kind, index, name):
         self.kind, self.index, self.name = kind, index, name
+        self.modes = None        # カメラの使える形式の一覧 (初めて開くときに読む)
+        self.mode = None         # 使う人が選んだ形式 (None なら自動で選ぶ)
+
+    def load_modes(self):
+        """カメラの使える形式の一覧を読む (一度読んだら覚えておく)。"""
+        if self.modes is None:
+            self.modes = capture.camera_modes(self.index, self.name) if self.kind == "camera" else []
+        return self.modes
 
     def label(self):
         return f"{'SDI 入力' if self.kind == 'sdi' else 'カメラ'}: {self.name}"
@@ -210,7 +218,8 @@ class CameraInput:
         self._messages = ctx.Queue()
         self._stop = ctx.Event()
         self._proc = ctx.Process(target=capture.camera_worker, daemon=True,
-                                 args=(self.device.index, self.name, self._state, self._messages, self._stop))
+                                 args=(self.device.index, self.name, self._state, self._messages, self._stop,
+                                       self.device.mode))
         self._proc.start()
         return self
 

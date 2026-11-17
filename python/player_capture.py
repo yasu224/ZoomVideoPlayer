@@ -122,6 +122,18 @@ def best_mode(modes):
     return max(pool, key=lambda m: (m[0] * m[1], m[2], len(m) < 4 or m[3][0] == "pixel_format"))
 
 
+def mode_label(mode):
+    """形式のメニューに出す文字 (「1920×1080 59.94fps」、Windows は「… (yuyv422)」)。"""
+    text = f"{mode[0]}×{mode[1]} {mode[2]:.2f}fps"
+    return f"{text} ({mode[3][1]})" if len(mode) > 3 else text
+
+
+def mode_key(mode):
+    """形式を設定に残すときの文字 (機器ごとに、次に起動したときも同じ形式を選ぶため)。"""
+    key = f"{mode[0]}x{mode[1]}@{mode[2]:.4f}"
+    return f"{key}@{mode[3][0]}={mode[3][1]}" if len(mode) > 3 else key
+
+
 class CameraEffects:
     """macOS のビデオエフェクト (コントロールセンターの「ビデオエフェクト」) の状態を読む。
 
@@ -184,8 +196,8 @@ class CameraEffects:
         return names
 
 
-def open_camera(index, name):
-    """カメラを開く (1080p 60fps 前後があればそれで、NV12 で受け取る)。
+def open_camera(index, name, mode=None):
+    """カメラを開く (mode を選んでいればその形式で、無ければ 1080p 60fps 前後があればそれで。NV12 で受け取る)。
 
     index が文字列なら動画ファイルのパスとして開く (カメラの代わりに確かめるとき用)。
     """
@@ -194,7 +206,7 @@ def open_camera(index, name):
         return av.open(index)
     fmt = camera_format()
     options = {"pixel_format": "nv12"} if fmt == "avfoundation" else {}
-    mode = best_mode(camera_modes(index, name))
+    mode = mode or best_mode(camera_modes(index, name))
     if mode:
         options["video_size"] = f"{mode[0]}x{mode[1]}"
         options["framerate"] = f"{mode[2]:.6f}".rstrip("0").rstrip(".")
@@ -357,9 +369,9 @@ class CameraCapture:
             unlink_shared_memory(shm)
 
 
-def camera_worker(index, name, state, messages, stop):
-    """別プロセスの入口。"""
-    capture = CameraCapture(lambda: open_camera(index, name), state, messages, stop)
+def camera_worker(index, name, state, messages, stop, mode=None):
+    """別プロセスの入口。mode は使う人が選んだ形式 (None なら自動で選ぶ)。"""
+    capture = CameraCapture(lambda: open_camera(index, name, mode), state, messages, stop)
     if not isinstance(index, str):          # 本物のカメラのときだけ (動画ファイルで確かめるときは要らない)
         capture.effects = CameraEffects()
         capture.effects.turn_off_center_stage()

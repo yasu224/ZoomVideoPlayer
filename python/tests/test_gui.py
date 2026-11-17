@@ -289,3 +289,90 @@ class GuiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CameraModeMenuTest(unittest.TestCase):
+    """カメラの形式 (解像度・fps) のメニュー。作り物のカメラで、選ぶと開き直し、機器ごとに覚えるかを確かめる。"""
+
+    MODES = [(1280, 720, 60.0), (1920, 1080, 60.0), (1920, 1080, 120.0)]
+
+    class FakeSource:
+        fmt, size, signal, error, effects = "nv12", (0, 0), False, "", []
+
+        def __init__(self, device):
+            self.device, self.name = device, device.name
+            self.mode = device.mode
+
+        def latest(self):
+            return None
+
+        def stats(self):
+            return 0, 0
+
+        def status(self):
+            return ""
+
+        def frame_rate(self):
+            return Fraction(30)
+
+        def close(self):
+            pass
+
+    def setUp(self):
+        import tempfile
+        from PySide6.QtCore import QSettings
+        import player_capture
+        import player_gui_live
+        import player_live
+        self.player_live = player_live
+        ini = os.path.join(tempfile.mkdtemp(), "settings.ini")
+        self.opened = []
+
+        def fake_open(device):
+            self.opened.append(device.mode)
+            return self.FakeSource(device)
+        self.patches = [
+            mock.patch.object(player_gui_live.LiveMixin, "settings",
+                              staticmethod(lambda: QSettings(ini, QSettings.IniFormat))),
+            mock.patch.object(player_capture, "camera_modes", lambda index, name: list(self.MODES)),
+            mock.patch.object(player_live.LiveDevice, "open", fake_open),
+        ]
+        for p in self.patches:
+            p.start()
+        self.w = player_gui.MainWindow()
+        self.w.show()
+        if not hasattr(self.w.view, "render_soon"):    # 入力の表示は GPU 描画用。CPU 描画のテストでは何もしない
+            self.w.view.render_soon = lambda: None
+
+    def tearDown(self):
+        self.w.exit_live()
+        self.w.close()
+        for p in self.patches:
+            p.stop()
+
+    def test_choose_and_remember(self):
+        w, combo = self.w, self.w.mode_combo
+        device = self.player_live.LiveDevice("camera", 0, "GC553Pro/USB")
+        w.open_live(device)
+        self.assertFalse(combo.isHidden())
+        self.assertEqual(combo.count(), 1 + len(self.MODES))
+        self.assertEqual(combo.itemText(0), "自動 (1920×1080 60.00fps)")
+        self.assertEqual(self.opened, [None])
+
+        combo.setCurrentIndex(3)                       # 1920×1080 120fps を選ぶ → その形式で開き直す
+        self.assertEqual(self.opened[-1], (1920, 1080, 120.0))
+        self.assertEqual(w.live.mode, (1920, 1080, 120.0))
+        self.assertEqual(combo.currentIndex(), 3)
+
+        w.exit_live()
+        self.assertTrue(combo.isHidden())
+        again = self.player_live.LiveDevice("camera", 0, "GC553Pro/USB")   # 次に起動したときと同じ
+        w.open_live(again)
+        self.assertEqual(self.opened[-1], (1920, 1080, 120.0))
+        self.assertEqual(combo.currentIndex(), 3)
+
+        combo.setCurrentIndex(0)                       # 自動に戻すと、覚えていた形式も消す
+        self.assertIsNone(self.opened[-1])
+        w.exit_live()
+        w.open_live(self.player_live.LiveDevice("camera", 0, "GC553Pro/USB"))
+        self.assertIsNone(self.opened[-1])
