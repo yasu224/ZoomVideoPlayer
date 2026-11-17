@@ -9,9 +9,9 @@ macOS のカメラ (AVFoundation) では、映像が届いていないと FFmpeg
 その名前を queue で知らせる。
 """
 import re
-import sys
 import time
 
+from player_os import IS_MAC, IS_WIN, ObjC
 from player_core import attach_shared_memory, even_size, frame_size, gpu_format, unlink_shared_memory, write_frame
 
 BUFFERS = 4           # バッファの数 (表示中・最新・書き込み中 + 予備)
@@ -26,7 +26,7 @@ STATE_SIZE = 9
 
 def camera_format():
     """FFmpeg でカメラを読む形式 (macOS は AVFoundation、Windows は DirectShow)。無ければ None。"""
-    return {"darwin": "avfoundation", "win32": "dshow"}.get(sys.platform)
+    return "avfoundation" if IS_MAC else "dshow" if IS_WIN else None
 
 
 def ffmpeg_log(url, fmt, options):
@@ -57,21 +57,48 @@ def camera_names():
     if fmt not in av.formats_available:
         return []
     url = "" if fmt == "avfoundation" else "dummy"
-    names, video = [], False
-    for line in ffmpeg_log(url, fmt, {"list_devices": "true"}):
-        if "video devices" in line.lower():
-            video = True
+    return list(enumerate(parse_device_names(ffmpeg_log(url, fmt, {"list_devices": "true"}), fmt)))
+
+
+def parse_device_names(lines, fmt):
+    """FFmpeg の機器一覧のログから、映像の機器の名前を順に返す。
+
+    DirectShow の書き方は FFmpeg の版で 2 通りある。古い版は「DirectShow video devices」の見出しの下に
+    名前を並べ、新しい版 (5.0 以降) は見出しなしで 1 台ずつ「"名前" (video)」と書く。
+    ログは途中で切れて届くことがあり、「(video)」が名前の次の行に来る。
+    """
+    names, section, pending = [], None, None
+    for line in lines:
+        text = line.strip()
+        lower = text.lower()
+        if "video devices" in lower:
+            section, pending = "video", None
             continue
-        if "audio devices" in line.lower():
-            video = False
+        if "audio devices" in lower:
+            section, pending = "audio", None
             continue
-        if not video:
+        if fmt == "avfoundation":
+            if section == "video" and line.startswith("[") and "]" in line:
+                names.append(line.split("]", 1)[1].strip())
             continue
-        if fmt == "avfoundation" and line.startswith("[") and "]" in line:
-            names.append(line.split("]", 1)[1].strip())
-        elif fmt == "dshow" and line.startswith('"') and line.count('"') >= 2:
-            names.append(line.split('"')[1])
-    return list(enumerate(names))
+        if fmt != "dshow":
+            continue
+        if line.startswith('"') and line.count('"') >= 2:
+            name, kind = line.split('"')[1], line.split('"', 2)[2].strip()
+            pending = None
+            if kind.startswith("(video"):
+                names.append(name)
+            elif kind.startswith("("):
+                pass  # (audio) や (none)
+            elif section == "video":
+                names.append(name)
+            elif section is None:
+                pending = name  # 種類は次の行に来る
+        elif pending is not None and text:
+            if text.startswith("(video"):
+                names.append(pending)
+            pending = None
+    return names
 
 
 def camera_modes(index, name=None):
@@ -149,31 +176,22 @@ class CameraEffects:
 
     def __init__(self):
         self.ok = False
-        if sys.platform != "darwin":
+        if not IS_MAC:
             return
         try:
-            import ctypes
-            import ctypes.util
-            objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
-            ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AVFoundation.framework/AVFoundation")
-            objc.objc_getClass.restype = objc.sel_registerName.restype = ctypes.c_void_p
-            objc.objc_getClass.argtypes = objc.sel_registerName.argtypes = [ctypes.c_char_p]
-            objc.class_getClassMethod.restype = ctypes.c_void_p
-            objc.class_getClassMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            send = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
-            # objc_msgSend は呼ぶメソッドの型に合わせて呼ぶ (arm64 では可変長引数として呼べない)
-            self._get = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(send)
-            self._set_int = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(send)
-            self._set_bool = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(send)
+            objc = ObjC("AVFoundation")
+            c = objc.ctypes
+            self._get = objc.msg(c.c_bool)
+            self._set_int = objc.msg(None, c.c_long)
+            self._set_bool = objc.msg(None, c.c_bool)
             self._objc = objc
-            self._cls = objc.objc_getClass(b"AVCaptureDevice")
+            self._cls = objc.cls("AVCaptureDevice")
             self.ok = bool(self._cls)
         except (OSError, AttributeError):
             pass
 
     def _method(self, name):
-        sel = self._objc.sel_registerName(name.encode())
-        return sel if self._objc.class_getClassMethod(self._cls, sel) else None
+        return self._objc.class_method(self._cls, name)
 
     def turn_off_center_stage(self):
         """センターフレームをアプリが決める側にして切る (カメラを開く前に呼ぶ)。"""
@@ -329,7 +347,8 @@ class CameraCapture:
         with st.get_lock():
             st[S_FRAMES] += 1
             st[S_LAST_AT] = time.time()
-            idx = next((i for i in range(BUFFERS) if i not in (int(st[S_HELD]), int(st[S_LATEST]))), -1)
+            busy = (int(st[S_HELD]), int(st[S_LATEST]))       # 表示中と最新には書かない
+            idx = next((i for i in range(BUFFERS) if i not in busy), -1)
             if idx < 0:
                 st[S_DROPPED] += 1
                 return

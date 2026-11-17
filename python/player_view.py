@@ -500,6 +500,11 @@ def apply_white_balance(matrix, offset, wb):
     return m.astype(np.float32), tuple(float(o - d) for o, d in zip(offset, shift))
 
 
+# 画像全体を指すテクスチャ座標と、出力全体を覆う四角 (描くたびに作らないよう作り置く。書き換えない)
+QUAD_UV = np.array([0, 0, 1, 0, 0, 1, 1, 1], np.float32)
+FULL_QUAD = np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32)
+
+
 class TextureSet:
     """Y / U / V の 3 枚のテクスチャと、いま入っているコマ (key) と形 (layout)。"""
 
@@ -556,6 +561,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         self.setFormat(fmt)
         self._init_view()
         self.bt709, self.full_range = True, False
+        self._color_key = self._color = None   # 色変換の係数の作り置き (color_matrix)
         self.wb = None              # 自動WB の R・G・B の (倍率, ずれ) (入力の表示で使う。white_balance)
         self.program = None
         self.sets = []          # テクスチャの組 (表で使う組と、次のコマを先に送っておく裏の組)
@@ -751,10 +757,20 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         x0, x1 = rect.left() / W * 2 - 1, rect.right() / W * 2 - 1
         y0, y1 = 1 - rect.top() / H * 2, 1 - rect.bottom() / H * 2
         pos = np.array([x0, y0, x1, y0, x0, y1, x1, y1], np.float32)
-        uv = np.array([0, 0, 1, 0, 0, 1, 1, 1], np.float32)
         GL.glVertexAttribPointer(self.attr_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, pos)
-        GL.glVertexAttribPointer(self.attr_uv, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, uv)
+        GL.glVertexAttribPointer(self.attr_uv, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, QUAD_UV)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+
+    def color_matrix(self, bits):
+        """YUV → RGB の係数とオフセット (自動WB 込み)。入れるものが変わったときだけ計算し直す。
+
+        書き換えのたびに描くので、毎回計算しない (自動WB が入っていると連立方程式も解くため)。
+        """
+        key = (self.bt709, self.full_range, bits, self.wb)
+        if key != self._color_key:
+            self._color = apply_white_balance(*yuv_matrix(self.bt709, self.full_range, bits), self.wb)
+            self._color_key = key
+        return self._color
 
     def paintGL(self):
         if not self.initialized:
@@ -775,8 +791,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glUseProgram(self.program)
         fmt = self.picture.fmt
         bits = YUV_FORMATS[fmt][3]
-        matrix, offset = yuv_matrix(self.bt709, self.full_range, bits)
-        matrix, offset = apply_white_balance(matrix, offset, self.wb)
+        matrix, offset = self.color_matrix(bits)
         GL.glUniformMatrix3fv(self.loc["yuv_to_rgb"], 1, GL.GL_FALSE, matrix)
         GL.glUniform3f(self.loc["offset"], *offset)
         # 16bit テクスチャは 65535 を 1 として読めるので、bits ビットの最大値が 1 になるよう直す
@@ -874,9 +889,8 @@ class GpuWindow(ViewBase, QOpenGLWindow):
         GL.glUniform1i(loc["tex_codes"], SDI_CODES_UNIT)
         GL.glUniform2f(loc["out_size"], out.width, H)
         GL.glUniform4f(loc["xform"], ox, oy, self.picture.w * so, self.picture.h * so)
-        pos = np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32)
         GL.glEnableVertexAttribArray(self.sdi_attr_pos)
-        GL.glVertexAttribPointer(self.sdi_attr_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, pos)
+        GL.glVertexAttribPointer(self.sdi_attr_pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, FULL_QUAD)
         if out.ten_bit:
             # 1 回目: 2 画素ごとに色を変換してコード値を書く。2 回目: それを v210 に詰める
             cfb, ctex, CW = self._sdi_codes_for(TW * 3 // 4, H)     # 1 語 = 1.5 画素、2 画素で 1 組

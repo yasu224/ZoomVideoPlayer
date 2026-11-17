@@ -11,6 +11,8 @@ from fractions import Fraction
 
 import av
 
+from player_os import IS_WIN
+
 
 class VideoSource:
     """1 つの動画ファイル。メタデータ、フレーム単位のシーク、順次デコードを受け持つ。
@@ -416,7 +418,6 @@ def attach_shared_memory(name=None, create_size=0):
     登録を外すと画面側の登録まで消え、画面側が片付けるときに KeyError が出る。
     そのため、開くときに登録そのものをしない (Python 3.13 の track=False と同じ)。
     """
-    import os
     import sys
     from multiprocessing import shared_memory
 
@@ -425,7 +426,7 @@ def attach_shared_memory(name=None, create_size=0):
             return shared_memory.SharedMemory(create=True, size=create_size, **extra)
         return shared_memory.SharedMemory(name=name, **extra)
 
-    if os.name != "posix":                 # Windows は後始末の登録をしない (OS が片付ける)
+    if IS_WIN:                             # Windows は後始末の登録をしない (OS が片付ける)
         return open_shm()
     if sys.version_info >= (3, 13):
         return open_shm(track=False)
@@ -448,9 +449,8 @@ def unlink_shared_memory(shm):
 
     標準の unlink() は後始末の登録も外そうとするので、登録していないものに使うと KeyError の警告が出る。
     """
-    import os
     import sys
-    if os.name != "posix":                 # Windows は、すべて閉じれば OS が消す
+    if IS_WIN:                             # Windows は、すべて閉じれば OS が消す
         return
     if sys.version_info >= (3, 13):
         return shm.unlink()
