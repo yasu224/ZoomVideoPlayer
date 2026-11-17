@@ -129,11 +129,24 @@ DSHOW_MODE = re.compile(r"(vcodec|pixel_format)=(\S+)\s+min s=\d+x\d+ fps=[\d.]+
 
 def parse_dshow_modes(lines):
     """DirectShow の list_options の行 (「pixel_format=yuyv422  min s=… fps=… max s=1920x1080 fps=60」など)
-    から、(幅, 高さ, いちばん高い fps, ("pixel_format" か "vcodec", その値)) の一覧を作る。"""
+    から、(幅, 高さ, いちばん高い fps, ("pixel_format" か "vcodec", その値)) の一覧を作る。
+
+    ログは途中で切れて届くことがあり (FFmpeg の新しい版)、「pixel_format=…」と「min s=…」が別の行に来る。
+    そのときは前の行の形式とつないで読む。
+    """
     modes = set()
+    head = ""                     # 「min s=…」がまだ来ていない「pixel_format=…」の行
     for line in lines:
-        m = DSHOW_MODE.search(line)
+        text = line.strip()
+        if text.startswith(("pixel_format=", "vcodec=")):
+            head = text
+        elif text.startswith("min s=") and head:
+            text = f"{head}  {text}"
+        else:
+            continue
+        m = DSHOW_MODE.search(text)
         if m:
+            head = ""
             kind, value, w, h, fps = m.groups()
             modes.add((int(w), int(h), float(fps), (kind, value)))
     return sorted(modes)
