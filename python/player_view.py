@@ -4,6 +4,7 @@ import importlib
 from concurrent.futures import ThreadPoolExecutor
 import math
 import os
+import sys
 
 import numpy as np
 from player_core import SEMI, YUV_FORMATS, plane_sizes, texture_scale
@@ -20,6 +21,23 @@ SDI_PBOS = 4           # SDI 用の読み出しバッファの数
 SDI_CODES_UNIT = 4     # v210 の 2 回目で、1 回目の結果を付けるテクスチャユニット (0〜2 は Y/U/V、3 は作るとき用)
 
 
+def import_gl():
+    """PyOpenGL の GL を読み込む。命令ごとのエラーの確かめ (glGetError) は切ってから読み込む。
+
+    PyOpenGL は標準では GL の命令のたびに glGetError を呼ぶ。glGetError は GPU を待つので、垂直同期で
+    待たされる所 (書き換え 1 回に 1 度) ではドライバによってはその間 CPU を回し続ける。Windows の
+    1080p 再生で、画面側のスレッドの CPU が 1 コマ 15ms (60Hz の 1 コマほぼ全部) から 2ms ほどに減った。
+    シェーダーの失敗は compileProgram が自分で確かめ、無い命令は NullFunctionError になるので、
+    GPU 描画が使えるかの判定 (initializeGL) は変わらない。
+    設定は読み込むときに決まるので、GL を読み込む所はすべてここを通す。
+    環境変数 ZVP_GL_DEBUG=1 で確かめを戻せる (GL のエラーがその場で例外になる)。
+    """
+    if "OpenGL.GL" not in sys.modules and os.environ.get("ZVP_GL_DEBUG") != "1":
+        import OpenGL
+        OpenGL.ERROR_CHECKING = False
+    return importlib.import_module("OpenGL.GL")
+
+
 def gpu_wanted():
     """GPU 描画を試すか。PyOpenGL が読み込めれば試す (実際に使えるかは GpuWindow が確かめる)。
 
@@ -29,7 +47,7 @@ def gpu_wanted():
     if os.environ.get("ZVP_RENDERER", "").lower() == "cpu":
         return False
     try:
-        importlib.import_module("OpenGL.GL")
+        import_gl()
         return True
     except Exception:
         return False
@@ -605,7 +623,7 @@ class GpuWindow(ViewBase, QOpenGLWindow):
 
     def initializeGL(self):
         try:
-            from OpenGL import GL
+            GL = import_gl()
             from OpenGL.GL import shaders
             self.GL = GL
             name = (GL.glGetString(GL.GL_RENDERER) or b"").decode(errors="replace")

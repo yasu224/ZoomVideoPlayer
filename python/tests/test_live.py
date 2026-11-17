@@ -71,6 +71,23 @@ class CameraModeTest(unittest.TestCase):
         self.assertEqual(player_capture.best_mode(same), (1280, 720, 60.0, ("pixel_format", "nv12")))
 
 
+    def test_windows_modes_split_lines(self):
+        """新しい FFmpeg ではログが切れて届き、形式と大きさが別の行に来る (GC553Pro で見た形)。"""
+        lines = [
+            'DirectShow video device options (from video devices)',
+            ' Pin "Capture" (alternative pin name "0")',
+            '  pixel_format=yuyv422', '  min s=1920x1080 fps=29.97 max s=1920x1080 fps=60.0002', '',
+            '  pixel_format=yuyv422', '  min s=1920x1080 fps=29.97 max s=1920x1080 fps=60.0002',
+            ' (tv, bt709/bt709/unknown', ', topleft', ')', '',
+            '  pixel_format=yuyv422', '  min s=1280x720 fps=29.97 max s=1280x720 fps=60.0002', '',
+            '  vcodec=mjpeg', '  min s=3840x2160 fps=5 max s=3840x2160 fps=30', '',
+        ]
+        self.assertEqual(player_capture.parse_dshow_modes(lines), [
+            (1280, 720, 60.0002, ("pixel_format", "yuyv422")),
+            (1920, 1080, 60.0002, ("pixel_format", "yuyv422")),
+            (3840, 2160, 30.0, ("vcodec", "mjpeg")),
+        ])
+
     def test_mode_label_and_key(self):
         """形式のメニューの文字と、設定に残す文字。"""
         mac = (1920, 1080, 59.94)

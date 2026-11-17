@@ -166,6 +166,10 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
   右上のバッジに「GPU描画」と出ます。
 - OpenGL が使えない PC では自動で「CPU描画」に切り替わります（遅くなります）。
   環境変数 `ZVP_RENDERER=cpu` で CPU 描画を強制できます。
+- PyOpenGL の、GL の命令ごとのエラーの確かめ (glGetError) は切っています。glGetError は GPU を待つので、
+  垂直同期で待たされる所ではドライバによってはその間 CPU を回し続け、Windows の 1080p 再生で画面側の
+  スレッドが 1 コマ 15ms (60Hz の 1 コマほぼ全部) CPU を使っていました (切ると 2ms ほど)。
+  環境変数 `ZVP_GL_DEBUG=1` で確かめを戻せます (GL のエラーがその場で例外になります)。
 - GPU 描画の表示部分はウィジェットではなく専用の OpenGL ウィンドウ (QOpenGLWindow) で、
   メインウィンドウに埋め込んでいます。ウィジェットだと Qt がウィンドウ全体を合成し直す分遅く、
   1080p / 120fps で 120 コマ出せなかったためです。キー入力とドロップはメインウィンドウへ渡しています。
