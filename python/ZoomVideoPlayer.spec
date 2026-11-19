@@ -38,6 +38,10 @@ def keep(entry):
 # SDI 出力用のライブラリ (build_sdi_mac.sh / build_sdi.bat で作ったもの) があれば一緒に入れる
 SDI_LIB = os.path.join("sdi", "libzvp_decklink.dylib" if MAC else "zvp_decklink.dll")
 SDI_BINARIES = [(SDI_LIB, "sdi")] if os.path.exists(SDI_LIB) else []
+# macOS のカメラを AVFoundation で直接読むライブラリ (build_cam_mac.sh で作ったもの) があれば一緒に入れる
+CAM_LIB = os.path.join("cam", "libzvp_avcam.dylib")
+if MAC and os.path.exists(CAM_LIB):
+    SDI_BINARIES.append((CAM_LIB, "cam"))
 
 a = Analysis(
     ["zoom_player.py"],

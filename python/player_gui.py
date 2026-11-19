@@ -171,6 +171,7 @@ class MainWindow(LiveMixin, QMainWindow):
         self.cache = FrameCache()    # 停止中に見たコマ (戻るコマ送りを速くする)
         self.scrub_value = None      # シークバーをドラッグ中の、まだ表示していない位置
         self.hw_decode = False       # 再生中のデコードをハードウェアで行っているか (load で決める)
+        self.camera_wb = None        # 表示中のカメラのホワイトバランス (player_capture.CameraWhiteBalance。使えなければ None)
         self.live = None             # 表示中の映像入力 (player_live の SdiInput / CameraInput)。None なら動画ファイル
         self.live_frozen = False     # 入力の表示を止めている (静止)
         self.live_received = 0       # 統計の表示で、前回までに受け取ったコマ数
@@ -291,6 +292,15 @@ class MainWindow(LiveMixin, QMainWindow):
         self.mode_combo.setVisible(False)
         self.mode_combo.currentIndexChanged.connect(self.camera_mode_changed)
         top.addWidget(self.mode_combo)
+        self.cam_wb_combo = QComboBox()
+        self.cam_wb_combo.setFocusPolicy(Qt.NoFocus)
+        self.cam_wb_combo.setToolTip("カメラ自身のホワイトバランス (USB カメラの UVC の設定)。\n"
+                                     "映像全体が青や黄色に寄るときは「自動」にするか、照明に合う色温度を選ぶ。\n"
+                                     "カメラの中で直すので、画面・SDI 出力・録画のどれにも効く。選んだ設定は機器ごとに覚える")
+        self.cam_wb_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cam_wb_combo.setVisible(False)
+        self.cam_wb_combo.currentIndexChanged.connect(self.camera_wb_changed)
+        top.addWidget(self.cam_wb_combo)
         self.name_label = QLabel("")
         self.name_label.setObjectName("dim")
         top.addWidget(self.name_label, 1)
@@ -416,6 +426,7 @@ class MainWindow(LiveMixin, QMainWindow):
         self.wb_check.setVisible(live)
         self.wb_check.setEnabled(isinstance(self.view, GpuWindow))
         self.mode_combo.setVisible(live and self.live.device.kind == "camera")
+        self.cam_wb_combo.setVisible(live and self.live.device.kind == "camera" and self.camera_wb is not None)
 
     def show_help(self):
         QMessageBox.information(self, "操作方法", HELP_TEXT)

@@ -121,6 +121,56 @@ class LiveMixin:
         combo.setEnabled(bool(modes))
         combo.blockSignals(False)
 
+    # ---------- カメラ自身のホワイトバランス (UVC) ----------
+    @staticmethod
+    def camera_wb_setting(device):
+        return "live/camera_wb/" + device.name.replace("/", "_").replace("\\", "_")
+
+    def setup_camera_wb(self, device):
+        """カメラのホワイトバランスを読み、前に選んだ設定があればカメラに入れ直して、メニューを作る。
+
+        UVC の設定はカメラをつなぎ直すと戻ることがあるので、開くたびに入れ直す。"""
+        wb = capture.CameraWhiteBalance.read(device.name)
+        saved = self.settings().value(self.camera_wb_setting(device), "", type=str)
+        if wb is not None and saved:
+            if saved == "auto" and wb.has_auto:
+                capture.CameraWhiteBalance.apply(device.name, True)
+            elif saved.isdigit() and wb.t_max:
+                capture.CameraWhiteBalance.apply(device.name, False, min(max(int(saved), wb.t_min), wb.t_max))
+            wb = capture.CameraWhiteBalance.read(device.name) or wb
+        self.camera_wb = wb
+        self.fill_camera_wb()
+
+    def fill_camera_wb(self):
+        combo, wb = self.cam_wb_combo, self.camera_wb
+        combo.blockSignals(True)
+        combo.clear()
+        if wb is not None:
+            if wb.has_auto:
+                combo.addItem("カメラWB: 自動", "auto")
+            temps = wb.temperatures()
+            if wb.t_max and wb.t_cur and wb.t_cur not in temps:
+                temps = sorted(temps + [wb.t_cur])
+            for t in temps:
+                combo.addItem(f"カメラWB: {t}K" + (" (初期値)" if t == wb.t_def else ""), t)
+            current = "auto" if wb.has_auto and wb.auto_on else wb.t_cur
+            combo.setCurrentIndex(max(combo.findData(current), 0))
+        combo.blockSignals(False)
+
+    def camera_wb_changed(self):
+        """カメラのホワイトバランスを選んだ: カメラに入れ、機器ごとに覚える。"""
+        source, value = self.live, self.cam_wb_combo.currentData()
+        if source is None or source.device.kind != "camera" or value is None:
+            return
+        name = source.device.name
+        ok = capture.CameraWhiteBalance.apply(name, value == "auto", 0 if value == "auto" else value)
+        if ok:
+            self.settings().setValue(self.camera_wb_setting(source.device), str(value))
+        else:
+            QMessageBox.warning(self, "入力", f"{name} のホワイトバランスを変えられませんでした。")
+        self.camera_wb = capture.CameraWhiteBalance.read(name) or self.camera_wb
+        self.fill_camera_wb()
+
     def camera_mode_changed(self):
         """形式を選び直した: 覚えておき、その形式でカメラを開き直す。"""
         source = self.live
@@ -152,8 +202,10 @@ class LiveMixin:
         self.set_wb(None)
         # カメラ (macOS が渡す NV12) も SDI も、BT.709 の限定範囲 (16〜235)。前に開いた動画の設定を残さない
         self.set_view_color(True, False)
+        self.camera_wb = None
         if source.device.kind == "camera":
             self.fill_camera_modes(source.device)
+            self.setup_camera_wb(source.device)
         self.set_enabled(bool(self.src))
         self.update_sdi_sequence()
         self.timer.start()

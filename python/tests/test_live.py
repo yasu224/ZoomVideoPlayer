@@ -88,6 +88,22 @@ class CameraModeTest(unittest.TestCase):
             (3840, 2160, 30.0, ("vcodec", "mjpeg")),
         ])
 
+    def test_low_fps_modes_are_hidden(self):
+        """25fps より低い形式は出さない (USB カメラの 10〜23fps)。キャプチャー機器の高い fps は残す。"""
+        modes = [(1920, 1080, f) for f in (10.0, 15.0, 20.0, 23.0, 25.0, 30.0, 60.00024)] + [(1920, 1080, 240.0)]
+        real = player_capture.all_camera_modes
+        player_capture.all_camera_modes = lambda index, name=None: modes
+        try:
+            self.assertEqual([m[2] for m in player_capture.camera_modes(0, "cam")], [25.0, 30.0, 60.00024, 240.0])
+        finally:
+            player_capture.all_camera_modes = real
+
+    def test_white_balance_temperatures(self):
+        """カメラの色温度のメニュー: 500K ごとに、両端と初期値も入れる。色温度が無ければ空。"""
+        wb = player_capture.CameraWhiteBalance(1, 0, 2800, 6500, 4650, 4650)
+        self.assertEqual(wb.temperatures(), [2800, 3000, 3500, 4000, 4500, 4650, 5000, 5500, 6000, 6500])
+        self.assertEqual(player_capture.CameraWhiteBalance(1, 1, 0, 0, 0, 0).temperatures(), [])
+
     def test_mode_label_and_key(self):
         """形式のメニューの文字と、設定に残す文字。"""
         mac = (1920, 1080, 59.94)
@@ -107,16 +123,122 @@ class CameraModeTest(unittest.TestCase):
             @staticmethod
             def open(url, format=None, options=None, timeout=None):
                 opened.append(options)
-        real_modes, real_av = player_capture.camera_modes, sys.modules["av"]
+        real_modes, real_av, real_lib = player_capture.camera_modes, sys.modules["av"], player_capture.avcam_library
         player_capture.camera_modes = lambda index, name: [(1920, 1080, 60.0), (1920, 1080, 120.0)]
+        player_capture.avcam_library = lambda: None        # FFmpeg で開く道 (AVFoundation のライブラリが無いとき)
         sys.modules["av"] = FakeAv
         try:
             player_capture.open_camera(0, "cam")
             player_capture.open_camera(0, "cam", (1920, 1080, 120.0))
         finally:
             player_capture.camera_modes, sys.modules["av"] = real_modes, real_av
+            player_capture.avcam_library = real_lib
         self.assertEqual((opened[0]["video_size"], opened[0]["framerate"]), ("1920x1080", "60"))
         self.assertEqual((opened[1]["video_size"], opened[1]["framerate"]), ("1920x1080", "120"))
+
+
+class AvCamTest(unittest.TestCase):
+    """macOS で AVFoundation から読む側 (player_capture.AvCamCamera)。ライブラリの代わりに作り物を使う。"""
+
+    class FakeLib:
+        def __init__(self, frames, opens=True, unplug=False):
+            self.frames, self.opens, self.unplug, self.calls, self.closed = list(frames), opens, unplug, [], False
+            self.seq = 0
+
+        def zvp_cam_open(self, name, w, h, fps, err, errlen):
+            self.calls.append((name, w, h, fps))
+            if not self.opens:
+                err.value = "3840×2160 60.00fps の形式がありません".encode()
+                return None
+            return 1
+
+        def zvp_cam_exists(self, name):
+            return 1
+
+        def zvp_cam_fps(self, handle):
+            return 60.00024
+
+        def zvp_cam_wait(self, handle, last, timeout, w, h, t):
+            import time
+            if not self.frames:          # 届かない: 待った末に 0 (コマの列が尽きたら外れたことにする設定もできる)
+                time.sleep(0.001)
+                return -1 if self.unplug else 0
+            self.frames.pop(0)           # 呼ばれるたびに 1 コマ届いたことにする
+            self.seq += 1
+            w._obj.value, h._obj.value, t._obj.value = 4, 2, self.seq / 60
+            return self.seq
+
+        def zvp_cam_copy(self, handle, dst, size, w, h):
+            import ctypes
+            ctypes.memset(dst, self.seq, w * h * 3 // 2)
+            return self.seq
+
+        def zvp_cam_close(self, handle):
+            self.closed = True
+
+    def test_frames_and_empty_polls(self):
+        lib = self.FakeLib([1, 2])
+        cam = player_capture.AvCamCamera(lib, "4K U3 Camera", (3840, 2160, 60.0))
+        self.assertEqual(lib.calls, [(b"4K U3 Camera", 3840, 2160, 60.0)])
+        self.assertEqual(cam.streams.video[0].average_rate, Fraction(60))
+        packets = cam.demux(cam.streams.video[0])
+        got = [next(packets).decode() for _ in range(4)]
+        self.assertEqual([len(g) for g in got], [1, 1, 0, 0])      # 届かない間も止める合図を見られるよう空で返す
+        frame = got[1][0]
+        self.assertEqual((frame.format.name, frame.width, frame.height), ("nv12", 4, 2))
+        dst = np.zeros(12, np.uint8)
+        self.assertTrue(frame.write_into(dst, 4, 2))
+        self.assertTrue((dst == 2).all())
+        cam.close()
+        self.assertTrue(lib.closed)
+
+    def test_open_camera_uses_library_on_mac(self):
+        """macOS でライブラリがあれば、選んだ形式 (無ければ自動で選んだ形式) で AVFoundation から開く。"""
+        if player_capture.camera_format() != "avfoundation":
+            self.skipTest("macOS だけ")
+        lib = self.FakeLib([])
+        real_modes, real_lib = player_capture.camera_modes, player_capture.avcam_library
+        player_capture.camera_modes = lambda index, name: [(1920, 1080, 60.0), (3840, 2160, 60.0)]
+        player_capture.avcam_library = lambda: lib
+        try:
+            self.assertIsInstance(player_capture.open_camera(0, "cam"), player_capture.AvCamCamera)
+            player_capture.open_camera(0, "cam", (3840, 2160, 60.0))
+        finally:
+            player_capture.camera_modes, player_capture.avcam_library = real_modes, real_lib
+        self.assertEqual(lib.calls, [(b"cam", 1920, 1080, 60.0), (b"cam", 3840, 2160, 60.0)])
+
+    def test_unplugged_camera_ends_demux(self):
+        """カメラが外れたら demux が終わる (CameraCapture が開き直す)。"""
+        cam = player_capture.AvCamCamera(self.FakeLib([1], unplug=True), "cam", (1920, 1080, 60.0))
+        got = list(cam.demux(cam.streams.video[0]))
+        self.assertEqual([len(p.decode()) for p in got], [1])
+
+    def test_open_failure_has_reason(self):
+        with self.assertRaisesRegex(OSError, "形式がありません"):
+            player_capture.AvCamCamera(self.FakeLib([], opens=False), "cam", (3840, 2160, 60.0))
+
+    def test_capture_writes_avcam_frames(self):
+        """CameraCapture が AVFoundation のコマを共有メモリへ写す (FFmpeg のコマと同じ流れで)。"""
+        import multiprocessing as mp
+        import queue
+        import threading
+        import time
+        lib = self.FakeLib([1, 2, 3])
+        state = mp.get_context("spawn").Array("d", [-1, 0, -1, 0, 0, 0, 0, 0, 0])
+        messages, stop = queue.Queue(), threading.Event()
+        cap = player_capture.CameraCapture(lambda: player_capture.AvCamCamera(lib, "cam", (4, 2, 60.0)),
+                                           state, messages, stop)
+        thread = threading.Thread(target=cap.run)
+        thread.start()
+        time.sleep(0.2)
+        stop.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())                  # コマが来なくても止まる
+        self.assertEqual(int(state[player_capture.S_FRAMES]), 3)
+        fmt = messages.get_nowait()
+        self.assertEqual(fmt[0], "format")
+        self.assertEqual(fmt[3:6], ("nv12", 4, 2))
+        self.assertTrue(lib.closed)
 
 
 class CameraCaptureTest(unittest.TestCase):
