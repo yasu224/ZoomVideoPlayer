@@ -5,6 +5,6 @@
 set -e
 cd "$(dirname "$0")"
 clang -O2 -fobjc-arc -dynamiclib -fvisibility=hidden -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
-  cam/avcam_bridge.m -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Foundation \
+  cam/avcam_bridge.m -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Foundation -framework IOKit \
   -o cam/libzvp_avcam.dylib
 echo "ビルド完了: $(pwd)/cam/libzvp_avcam.dylib"

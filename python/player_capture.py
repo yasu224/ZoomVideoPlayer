@@ -103,8 +103,18 @@ def parse_device_names(lines, fmt):
     return names
 
 
+# これより低い fps の形式は出さない (動きがカクついて見えるので使わない。USB カメラは 10 / 15 / 20 / 23fps も
+# 知らせてくるが、残すのは 25 / 30 / 60fps など。キャプチャー機器の 50 / 120 / 240fps などは残る)
+MIN_FPS = 24.5
+
+
 def camera_modes(index, name=None):
-    """カメラの使える (幅, 高さ, fps) の一覧。Windows は (幅, 高さ, fps, 形式の指定) の一覧。
+    """カメラの使える (幅, 高さ, fps) の一覧 (MIN_FPS より低い fps は除く)。Windows は (幅, 高さ, fps, 形式の指定)。"""
+    return [m for m in all_camera_modes(index, name) if m[2] >= MIN_FPS]
+
+
+def all_camera_modes(index, name=None):
+    """カメラが知らせてくる形式すべて。
 
     macOS はわざと無い fps を指定して一覧のログを出させる。Windows は DirectShow に一覧を出させる。
     """
@@ -231,6 +241,7 @@ class CameraEffects:
 
 # ---------- macOS: AVFoundation で直接読む (cam/libzvp_avcam.dylib) ----------
 AVCAM_LIB = "libzvp_avcam.dylib"
+WB_STEP = 500         # カメラのホワイトバランスの色温度のメニューの刻み (K)
 _avcam = None
 _avcam_tried = False
 
@@ -268,8 +279,49 @@ def avcam_library():
     lib.zvp_cam_copy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int, ctypes.c_int]
     lib.zvp_cam_copy.restype = ctypes.c_int64
     lib.zvp_cam_close.argtypes = [ctypes.c_void_p]
+    lib.zvp_cam_wb_info.argtypes = [ctypes.c_char_p] + [ctypes.POINTER(ctypes.c_int)] * 6
+    lib.zvp_cam_wb_set.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     _avcam = lib
     return lib
+
+
+class CameraWhiteBalance:
+    """カメラ自身のホワイトバランス (UVC)。macOS で AVFoundation のライブラリがあるときだけ使える。
+
+    カメラによっては自動ホワイトバランスが切れたまま (固定の色温度) で、映像全体が青や黄色に寄る。
+    カメラの中で直すので、画面・SDI 出力・録画のどれも自然な色になる (表示だけを直す「自動WB」とは別)。
+    """
+
+    def __init__(self, has_auto, auto_on, t_min, t_max, t_cur, t_def):
+        self.has_auto, self.auto_on = bool(has_auto), bool(auto_on)
+        self.t_min, self.t_max, self.t_cur, self.t_def = t_min, t_max, t_cur, t_def
+
+    @classmethod
+    def read(cls, name, lib=None):
+        """今の状態。使えないカメラ (USB の UVC でない、ライブラリが無いなど) は None。"""
+        import ctypes
+        lib = lib or avcam_library()
+        if lib is None or not hasattr(lib, "zvp_cam_wb_info"):
+            return None
+        values = [ctypes.c_int() for _ in range(6)]
+        if not lib.zvp_cam_wb_info(name.encode("utf-8"), *[ctypes.byref(v) for v in values]):
+            return None
+        return cls(*[v.value for v in values])
+
+    def temperatures(self, step=WB_STEP):
+        """メニューに並べる色温度 (最小から最大まで step ごと。両端と初期値も入れる)。"""
+        if not self.t_max:
+            return []
+        values = set(range(-(-self.t_min // step) * step, self.t_max + 1, step)) | {self.t_min, self.t_max}
+        if self.t_min <= self.t_def <= self.t_max:
+            values.add(self.t_def)
+        return sorted(values)
+
+    @staticmethod
+    def apply(name, auto_on, temperature=0, lib=None):
+        """自動にするか、色温度 (K) に固定する。できたら True。"""
+        lib = lib or avcam_library()
+        return bool(lib and lib.zvp_cam_wb_set(name.encode("utf-8"), 1 if auto_on else 0, int(temperature)))
 
 
 class AvCamFrame:

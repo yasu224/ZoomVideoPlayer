@@ -237,3 +237,152 @@ EXPORT void zvp_cam_close(void *h) {
         dispatch_sync(cam.queue, ^{});     // 届きかけのコマを終わらせてから片付ける
     }
 }
+
+// ---------- カメラのホワイトバランス (UVC の Processing Unit) ----------
+// macOS には UVC カメラの設定を変える仕組みが無いので、USB の制御要求を直接送る。カメラの使用許可は要らない。
+// カメラは AVFoundation の名前で探し、modelID (「UVC Camera VendorID_13028 ProductID_26232」) の番号と、
+// uniqueID (「0x124000032e46678」= 位置 0x12400000 + 番号) の位置で USB の機器を見つける。
+#import <IOKit/IOKitLib.h>
+#import <IOKit/IOCFPlugIn.h>
+#import <IOKit/usb/IOUSBLib.h>
+
+enum { UVC_SET_CUR = 0x01, UVC_GET_CUR = 0x81, UVC_GET_MIN = 0x82, UVC_GET_MAX = 0x83, UVC_GET_DEF = 0x87 };
+enum { PU_WB_TEMPERATURE = 0x0A, PU_WB_TEMPERATURE_AUTO = 0x0B };
+
+typedef struct {
+    IOUSBDeviceInterface **dev;
+    UInt16 index;            // wIndex: (Processing Unit の番号 << 8) | VideoControl のインターフェース番号
+    UInt32 controls;         // Processing Unit の bmControls
+} Uvc;
+
+static AVCaptureDevice *find_camera(const char *name) {
+    NSCharacterSet *space = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *want = [[NSString stringWithUTF8String:name ?: ""] stringByTrimmingCharactersInSet:space];
+    for (AVCaptureDevice *d in all_cameras()) {
+        if ([[d.localizedName stringByTrimmingCharactersInSet:space] isEqualToString:want]) return d;
+    }
+    return nil;
+}
+
+static IOReturn uvc_request(Uvc *u, UInt8 type, UInt8 request, UInt8 selector, void *buf, UInt16 len) {
+    IOUSBDevRequest q = {type, request, (UInt16)(selector << 8), u->index, len, buf, 0};
+    return (*u->dev)->DeviceRequest(u->dev, &q);
+}
+
+static void uvc_close(Uvc *u) {
+    if (u->dev) (*u->dev)->Release(u->dev);
+    u->dev = NULL;
+}
+
+// カメラの USB 機器を開き、構成の記述子から VideoControl と Processing Unit を探す
+static BOOL uvc_open(const char *name, Uvc *u) {
+    memset(u, 0, sizeof(*u));
+    AVCaptureDevice *cam = find_camera(name);
+    if (!cam) return NO;
+    int vid = 0, pid = 0;
+    if (sscanf(cam.modelID.UTF8String ?: "", "UVC Camera VendorID_%d ProductID_%d", &vid, &pid) != 2) return NO;
+    unsigned long long uid = strtoull(cam.uniqueID.UTF8String ?: "", NULL, 16);
+    UInt32 location = (UInt32)(uid >> 32);
+    CFMutableDictionaryRef match = IOServiceMatching(kIOUSBDeviceClassName);
+    CFDictionarySetValue(match, CFSTR(kUSBVendorID), (__bridge CFNumberRef)@(vid));
+    CFDictionarySetValue(match, CFSTR(kUSBProductID), (__bridge CFNumberRef)@(pid));
+    io_iterator_t it;
+    if (IOServiceGetMatchingServices(MACH_PORT_NULL,   // 既定のポート (macOS 11 でも使える書き方)
+                                     match, &it) != KERN_SUCCESS) return NO;
+    io_service_t svc, chosen = 0;
+    while ((svc = IOIteratorNext(it))) {       // 同じ機種が 2 台あれば、位置で見分ける
+        NSNumber *loc = CFBridgingRelease(IORegistryEntryCreateCFProperty(svc, CFSTR(kUSBDevicePropertyLocationID),
+                                                                          kCFAllocatorDefault, 0));
+        if (!chosen || (location && loc.unsignedIntValue == location)) {
+            if (chosen) IOObjectRelease(chosen);
+            chosen = svc;
+        } else {
+            IOObjectRelease(svc);
+        }
+    }
+    IOObjectRelease(it);
+    if (!chosen) return NO;
+    IOCFPlugInInterface **plug = NULL;
+    SInt32 score;
+    kern_return_t kr = IOCreatePlugInInterfaceForService(chosen, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
+                                                         &plug, &score);
+    IOObjectRelease(chosen);
+    if (kr != KERN_SUCCESS || !plug) return NO;
+    (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID *)&u->dev);
+    (*plug)->Release(plug);
+    if (!u->dev) return NO;
+    UInt8 head[9];
+    IOUSBDevRequest q = {0x80, kUSBRqGetDescriptor, kUSBConfDesc << 8, 0, sizeof(head), head, 0};
+    if ((*u->dev)->DeviceRequest(u->dev, &q) != kIOReturnSuccess) { uvc_close(u); return NO; }
+    UInt16 total = (UInt16)(head[2] | head[3] << 8);
+    NSMutableData *cfg = [NSMutableData dataWithLength:total];
+    IOUSBDevRequest q2 = {0x80, kUSBRqGetDescriptor, kUSBConfDesc << 8, 0, total, cfg.mutableBytes, 0};
+    if ((*u->dev)->DeviceRequest(u->dev, &q2) != kIOReturnSuccess) { uvc_close(u); return NO; }
+    const UInt8 *d = cfg.bytes;
+    int iface = -1, cls = -1, sub = -1, unit = -1;
+    for (UInt32 i = 0; i + 2 < q2.wLenDone && d[i] >= 2; i += d[i]) {
+        if (d[i + 1] == kUSBInterfaceDesc && d[i] >= 9) {
+            iface = d[i + 2]; cls = d[i + 5]; sub = d[i + 6];
+        } else if (d[i + 1] == 0x24 && cls == 14 && sub == 1 && d[i + 2] == 5 && unit < 0 && d[i] >= 8) {
+            unit = d[i + 3];                      // VideoControl の中の Processing Unit
+            u->index = (UInt16)(unit << 8 | iface);
+            for (int b = 0; b < d[i + 7] && b < 4 && i + 8 + b < q2.wLenDone; b++) u->controls |= (UInt32)d[i + 8 + b] << (8 * b);
+        }
+    }
+    if (unit < 0) { uvc_close(u); return NO; }
+    return YES;
+}
+
+static int uvc_get16(Uvc *u, UInt8 request, UInt8 selector, int *value) {
+    UInt8 b[2] = {0};
+    if (uvc_request(u, 0xA1, request, selector, b, 2) != kIOReturnSuccess) return 0;
+    *value = b[0] | b[1] << 8;
+    return 1;
+}
+
+// カメラのホワイトバランスの状態。使えなければ 0。has_auto: 自動があるか、auto_on: 自動が入っているか、
+// t_*: 色温度 (K) の最小・最大・今・初期値 (色温度が無ければ 0)
+EXPORT int zvp_cam_wb_info(const char *name, int *has_auto, int *auto_on, int *t_min, int *t_max, int *t_cur, int *t_def) {
+    @autoreleasepool {
+        Uvc u;
+        if (!uvc_open(name, &u)) return 0;
+        *has_auto = *auto_on = *t_min = *t_max = *t_cur = *t_def = 0;
+        if (u.controls & (1u << 12)) {
+            UInt8 v = 0;
+            if (uvc_request(&u, 0xA1, UVC_GET_CUR, PU_WB_TEMPERATURE_AUTO, &v, 1) == kIOReturnSuccess) {
+                *has_auto = 1;
+                *auto_on = v ? 1 : 0;
+            }
+        }
+        if (u.controls & (1u << 6)) {
+            if (!(uvc_get16(&u, UVC_GET_MIN, PU_WB_TEMPERATURE, t_min) && uvc_get16(&u, UVC_GET_MAX, PU_WB_TEMPERATURE, t_max) &&
+                  uvc_get16(&u, UVC_GET_CUR, PU_WB_TEMPERATURE, t_cur))) {
+                *t_min = *t_max = *t_cur = 0;
+            }
+            uvc_get16(&u, UVC_GET_DEF, PU_WB_TEMPERATURE, t_def);
+        }
+        uvc_close(&u);
+        return *has_auto || *t_max ? 1 : 0;
+    }
+}
+
+// ホワイトバランスを自動 (auto_on = 1) にするか、色温度 temperature (K) に固定する。できたら 1
+EXPORT int zvp_cam_wb_set(const char *name, int auto_on, int temperature) {
+    @autoreleasepool {
+        Uvc u;
+        if (!uvc_open(name, &u)) return 0;
+        int ok = 1;
+        if (u.controls & (1u << 12)) {
+            UInt8 v = auto_on ? 1 : 0;
+            ok = uvc_request(&u, 0x21, UVC_SET_CUR, PU_WB_TEMPERATURE_AUTO, &v, 1) == kIOReturnSuccess;
+        } else if (auto_on) {
+            ok = 0;
+        }
+        if (ok && !auto_on && temperature > 0) {
+            UInt8 b[2] = {(UInt8)(temperature & 0xff), (UInt8)(temperature >> 8)};
+            ok = uvc_request(&u, 0x21, UVC_SET_CUR, PU_WB_TEMPERATURE, b, 2) == kIOReturnSuccess;
+        }
+        uvc_close(&u);
+        return ok;
+    }
+}

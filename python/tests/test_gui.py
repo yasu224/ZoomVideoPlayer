@@ -336,13 +336,28 @@ class CameraModeMenuTest(unittest.TestCase):
                               staticmethod(lambda: QSettings(ini, QSettings.IniFormat))),
             mock.patch.object(player_capture, "camera_modes", lambda index, name: list(self.MODES)),
             mock.patch.object(player_live.LiveDevice, "open", fake_open),
+            mock.patch.object(player_capture.CameraWhiteBalance, "read", self.fake_wb_read),
+            mock.patch.object(player_capture.CameraWhiteBalance, "apply", self.fake_wb_apply),
         ]
+        self.wb_state = {"auto_on": 0, "t_cur": 4650}
+        self.wb_applied = []
         for p in self.patches:
             p.start()
         self.w = player_gui.MainWindow()
         self.w.show()
         if not hasattr(self.w.view, "render_soon"):    # 入力の表示は GPU 描画用。CPU 描画のテストでは何もしない
             self.w.view.render_soon = lambda: None
+
+    def fake_wb_read(self, name, lib=None):
+        import player_capture
+        return player_capture.CameraWhiteBalance(1, self.wb_state["auto_on"], 2800, 6500, self.wb_state["t_cur"], 4650)
+
+    def fake_wb_apply(self, name, auto_on, temperature=0, lib=None):
+        self.wb_applied.append((bool(auto_on), temperature))
+        self.wb_state["auto_on"] = int(bool(auto_on))
+        if not auto_on and temperature:
+            self.wb_state["t_cur"] = temperature
+        return True
 
     def tearDown(self):
         self.w.exit_live()
@@ -376,3 +391,26 @@ class CameraModeMenuTest(unittest.TestCase):
         w.exit_live()
         w.open_live(self.player_live.LiveDevice("camera", 0, "GC553Pro/USB"))
         self.assertIsNone(self.opened[-1])
+
+    def test_camera_white_balance(self):
+        """カメラ自身のホワイトバランス: 今の状態を出し、選ぶとカメラに入れ、開き直したときも入れ直す。"""
+        w, combo = self.w, self.w.cam_wb_combo
+        w.open_live(self.player_live.LiveDevice("camera", 0, "4K U3 Camera"))
+        self.assertFalse(combo.isHidden())
+        self.assertEqual(combo.itemText(0), "カメラWB: 自動")
+        self.assertEqual(combo.currentData(), 4650)               # 自動が切れて 4650K に固定されている
+        self.assertEqual(self.wb_applied, [])                    # 選んでいなければカメラの設定は変えない
+
+        combo.setCurrentIndex(combo.findData("auto"))
+        self.assertEqual(self.wb_applied, [(True, 0)])
+        self.assertEqual(combo.currentData(), "auto")
+
+        self.wb_state["auto_on"] = 0                              # つなぎ直して自動が切れた
+        w.exit_live()
+        w.open_live(self.player_live.LiveDevice("camera", 0, "4K U3 Camera"))
+        self.assertEqual(self.wb_applied[-1], (True, 0))         # 覚えていた「自動」を入れ直す
+        self.assertEqual(combo.currentData(), "auto")
+
+        combo.setCurrentIndex(combo.findData(3000))
+        self.assertEqual(self.wb_applied[-1], (False, 3000))
+        self.assertEqual(combo.currentData(), 3000)

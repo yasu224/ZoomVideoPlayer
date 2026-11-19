@@ -88,6 +88,22 @@ class CameraModeTest(unittest.TestCase):
             (3840, 2160, 30.0, ("vcodec", "mjpeg")),
         ])
 
+    def test_low_fps_modes_are_hidden(self):
+        """25fps より低い形式は出さない (USB カメラの 10〜23fps)。キャプチャー機器の高い fps は残す。"""
+        modes = [(1920, 1080, f) for f in (10.0, 15.0, 20.0, 23.0, 25.0, 30.0, 60.00024)] + [(1920, 1080, 240.0)]
+        real = player_capture.all_camera_modes
+        player_capture.all_camera_modes = lambda index, name=None: modes
+        try:
+            self.assertEqual([m[2] for m in player_capture.camera_modes(0, "cam")], [25.0, 30.0, 60.00024, 240.0])
+        finally:
+            player_capture.all_camera_modes = real
+
+    def test_white_balance_temperatures(self):
+        """カメラの色温度のメニュー: 500K ごとに、両端と初期値も入れる。色温度が無ければ空。"""
+        wb = player_capture.CameraWhiteBalance(1, 0, 2800, 6500, 4650, 4650)
+        self.assertEqual(wb.temperatures(), [2800, 3000, 3500, 4000, 4500, 4650, 5000, 5500, 6000, 6500])
+        self.assertEqual(player_capture.CameraWhiteBalance(1, 1, 0, 0, 0, 0).temperatures(), [])
+
     def test_mode_label_and_key(self):
         """形式のメニューの文字と、設定に残す文字。"""
         mac = (1920, 1080, 59.94)

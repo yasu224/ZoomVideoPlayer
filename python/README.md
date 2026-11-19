@@ -71,7 +71,8 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
   （4K U3 Camera の 4K は後ろの yuvs ではコマが届かず、開くところで止まった）。ライブラリは大きさと fps が合う形式のうち
   420v を優先して選ぶ。`build_mac.sh` と `run_mac.sh` が `build_cam_mac.sh` で作る（Xcode か Command Line Tools の
   clang があればよい）。作れなかったときは FFmpeg で受け取る。
-  入力の右の「形式」メニューで、機器が知らせてくる解像度・fps（Windows は MJPEG / YUY2 などの形式も）から選べる。
+  入力の右の「形式」メニューで、機器が知らせてくる解像度・fps（Windows は MJPEG / YUY2 などの形式も）から選べる
+  （25fps より低い形式は動きがカクつくので出さない）。
   「自動」では 1080p の 60fps 前後があればそれを選び、無ければいちばん大きい形式（Windows は形式も選び、同じ大きさと fps なら
   MJPEG より圧縮していない形式）。選んだ形式は機器の名前ごとに覚え、次に開いたときも使う（選び直すとカメラを開き直す）。初めて使うときは macOS がカメラの使用許可を求める（Windows はプライバシーの設定で
   デスクトップ アプリのカメラが切られていると使えないので、そのときは案内を出す）。
@@ -82,6 +83,11 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
   macOS のビデオエフェクトは、リアクションのジェスチャーを既定で切り、センターフレームはアプリが切る
   （どちらも手や顔の検出に CPU を使い、映像も加工されるため）。ポートレート・スタジオ照明などはアプリから
   切れないので、入っていれば右上に出す（コントロールセンターで切れる）
+- 「カメラWB」（macOS で、UVC のホワイトバランスを持つ USB カメラのときだけ出る）: カメラ自身のホワイトバランスを
+  「自動」にするか、色温度（K）に固定する。カメラによっては自動が切れたまま（4K U3 Camera は 4650K に固定）で、
+  映像全体が青く寄る。カメラの中で直すので画面・SDI 出力・録画のどれにも効く。USB の制御要求を直接送るので、
+  カメラの使用許可は要らない。選んだ設定は機器ごとに覚え、カメラを開くたびに入れ直す（つなぎ直すと戻るカメラがあるため）。
+  選んでいなければカメラの設定は変えない
 - 「自動WB」（入力の表示中だけ出る）: 映像の色の崩れ（青っぽいなど）を自動で直して表示する。画素を明るさで
   段に分け、どの段も平均すれば灰色のはずとして、R と B の倍率とずれ（黒の色づき）を求める。画面と SDI 出力に効き、
   録画は入力のまま。チェックの状態は次に起動したときも残る
@@ -155,7 +161,7 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `player_os.py` | OS ごとの違いがある処理（画面のスレッドの優先度、裏に回っても OS に遅らせない設定） |
 | `player_sdi.py` | Blackmagic SDI 出力（機器の一覧、送るスレッド、出力の拡大の置き換え） |
 | `sdi/decklink_bridge.cpp`, `build_sdi_mac.sh` / `build_sdi.bat` | DeckLink SDK を呼ぶライブラリとそのビルド（macOS / Windows） |
-| `cam/avcam_bridge.m`, `build_cam_mac.sh` | macOS のカメラを AVFoundation で直接読むライブラリとそのビルド |
+| `cam/avcam_bridge.m`, `build_cam_mac.sh` | macOS のカメラを AVFoundation で直接読み、UVC のホワイトバランスを変えるライブラリとそのビルド |
 | `tools/check_sdi.py` | SDI 出力の確認（詰め方と、機器へ送れたコマ数） |
 | `tests/`, `run_tests.py`, `run_tests.bat`, `run_tests.sh` | 自動テスト |
 | `tools/check_gpu.py` | 本物の画面での GPU 描画の確認 |
