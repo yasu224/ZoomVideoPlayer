@@ -9,9 +9,12 @@ macOS のカメラ (AVFoundation) では、映像が届いていないと FFmpeg
 画面が表示中のバッファ (held) と最新のバッファには書かない。形式が変わったら新しい共有メモリを作り、
 その名前を queue で知らせる。
 """
+import ctypes
+import os
 import re
 import sys
 import time
+from fractions import Fraction
 
 from player_os import IS_MAC, IS_WIN, ObjC
 from player_core import attach_shared_memory, even_size, frame_size, gpu_format, unlink_shared_memory, write_frame
@@ -241,6 +244,7 @@ class CameraEffects:
 
 # ---------- macOS: AVFoundation で直接読む (cam/libzvp_avcam.dylib) ----------
 AVCAM_LIB = "libzvp_avcam.dylib"
+AVCAM_WAIT = 0.05     # 新しいコマを待つ最長の時間 (秒)。この間隔で止める合図を見る
 WB_STEP = 500         # カメラのホワイトバランスの色温度のメニューの刻み (K)
 _avcam = None
 _avcam_tried = False
@@ -257,29 +261,29 @@ def avcam_library():
     if _avcam_tried or not IS_MAC:
         return _avcam
     _avcam_tried = True
-    import ctypes
-    import os
     here = os.path.dirname(os.path.abspath(__file__))
-    paths = [os.path.join(base, "cam", AVCAM_LIB) for base in (getattr(sys, "_MEIPASS", None), here) if base]
-    path = next((p for p in paths if os.path.exists(p)), None)
+    bases = (getattr(sys, "_MEIPASS", None), here)          # PyInstaller でまとめたときは _MEIPASS の中
+    path = next((p for p in (os.path.join(b, "cam", AVCAM_LIB) for b in bases if b) if os.path.exists(p)), None)
     if path is None:
         return None
     try:
         lib = ctypes.CDLL(path)
     except OSError:
         return None
+    c_int_p = ctypes.POINTER(ctypes.c_int)
+    lib.zvp_cam_exists.argtypes = [ctypes.c_char_p]
     lib.zvp_cam_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_double,
                                  ctypes.c_char_p, ctypes.c_int]
     lib.zvp_cam_open.restype = ctypes.c_void_p
     lib.zvp_cam_fps.argtypes = [ctypes.c_void_p]
     lib.zvp_cam_fps.restype = ctypes.c_double
-    lib.zvp_cam_latest.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-                                   ctypes.POINTER(ctypes.c_double)]
-    lib.zvp_cam_latest.restype = ctypes.c_int64
+    lib.zvp_cam_wait.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, c_int_p, c_int_p,
+                                 ctypes.POINTER(ctypes.c_double)]
+    lib.zvp_cam_wait.restype = ctypes.c_int64
     lib.zvp_cam_copy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int, ctypes.c_int]
     lib.zvp_cam_copy.restype = ctypes.c_int64
     lib.zvp_cam_close.argtypes = [ctypes.c_void_p]
-    lib.zvp_cam_wb_info.argtypes = [ctypes.c_char_p] + [ctypes.POINTER(ctypes.c_int)] * 6
+    lib.zvp_cam_wb_info.argtypes = [ctypes.c_char_p] + [c_int_p] * 6
     lib.zvp_cam_wb_set.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     _avcam = lib
     return lib
@@ -297,11 +301,10 @@ class CameraWhiteBalance:
         self.t_min, self.t_max, self.t_cur, self.t_def = t_min, t_max, t_cur, t_def
 
     @classmethod
-    def read(cls, name, lib=None):
-        """今の状態。使えないカメラ (USB の UVC でない、ライブラリが無いなど) は None。"""
-        import ctypes
-        lib = lib or avcam_library()
-        if lib is None or not hasattr(lib, "zvp_cam_wb_info"):
+    def read(cls, name):
+        """今の状態。使えないカメラ (USB の UVC でない、ライブラリが無い、macOS でないなど) は None。"""
+        lib = avcam_library()
+        if lib is None:
             return None
         values = [ctypes.c_int() for _ in range(6)]
         if not lib.zvp_cam_wb_info(name.encode("utf-8"), *[ctypes.byref(v) for v in values]):
@@ -318,9 +321,9 @@ class CameraWhiteBalance:
         return sorted(values)
 
     @staticmethod
-    def apply(name, auto_on, temperature=0, lib=None):
+    def apply(name, auto_on, temperature=0):
         """自動にするか、色温度 (K) に固定する。できたら True。"""
-        lib = lib or avcam_library()
+        lib = avcam_library()
         return bool(lib and lib.zvp_cam_wb_set(name.encode("utf-8"), 1 if auto_on else 0, int(temperature)))
 
 
@@ -336,17 +339,17 @@ class AvCamFrame:
         self.camera, self.width, self.height, self.time = camera, width, height, time
 
     def write_into(self, dst, width, height):
-        import ctypes
         ptr = dst.ctypes.data_as(ctypes.c_void_p)
         return self.camera.lib.zvp_cam_copy(self.camera.handle, ptr, dst.nbytes, width, height) > 0
 
 
 class AvCamCamera:
     """AVFoundation で開いたカメラ。FFmpeg で開いたもの (av の container) と同じ使い方ができるようにしてある
-    (CameraCapture.read が streams.video[0] と demux を使う)。コマが届かない間も、止める合図を見られるように
-    POLL_SECONDS ごとに空の知らせを返す。"""
+    (CameraCapture.read が streams.video[0] と demux を使う)。
 
-    POLL_SECONDS = 0.002
+    demux は新しいコマが届くまでライブラリの中で待つ (GIL は放す)。届かないまま AVCAM_WAIT たったら空の知らせを
+    返すので、その間も止める合図を見られる。カメラが外れたら終わり、CameraCapture が開き直す (つなぎ直せば映る)。
+    """
 
     class _Packet:
         def __init__(self, frames):
@@ -355,30 +358,34 @@ class AvCamCamera:
         def decode(self):
             return self.frames
 
+    class _Stream:
+        guessed_rate = None
+
+        def __init__(self, rate):
+            self.average_rate = rate
+
     def __init__(self, lib, name, mode):
-        import ctypes
-        from fractions import Fraction
         self.lib = lib
         err = ctypes.create_string_buffer(512)
-        self.handle = lib.zvp_cam_open(name.encode("utf-8"), mode[0], mode[1], float(mode[2]), err, 512)
+        self.handle = lib.zvp_cam_open(name.encode("utf-8"), mode[0], mode[1], float(mode[2]), err, len(err))
         if not self.handle:
             raise OSError(err.value.decode("utf-8", "replace") or "カメラを開けません")
         fps = lib.zvp_cam_fps(self.handle)
-        stream = type("Stream", (), {"average_rate": Fraction(fps).limit_denominator(1001) if fps else None,
-                                     "guessed_rate": None})()
+        stream = self._Stream(Fraction(fps).limit_denominator(1001) if fps else None)
         self.streams = type("Streams", (), {"video": [stream]})()
         self.last_seq = 0
 
     def demux(self, stream):
-        import ctypes
         w, h, t = ctypes.c_int(), ctypes.c_int(), ctypes.c_double()
         while self.handle:
-            seq = self.lib.zvp_cam_latest(self.handle, ctypes.byref(w), ctypes.byref(h), ctypes.byref(t))
+            seq = self.lib.zvp_cam_wait(self.handle, self.last_seq, AVCAM_WAIT,
+                                        ctypes.byref(w), ctypes.byref(h), ctypes.byref(t))
+            if seq < 0:                      # カメラが外れた・止まった
+                return
             if seq > self.last_seq:
                 self.last_seq = seq
                 yield self._Packet([AvCamFrame(self, w.value, h.value, t.value)])
             else:
-                time.sleep(self.POLL_SECONDS)
                 yield self._Packet([])
 
     def close(self):
@@ -399,7 +406,7 @@ def open_camera(index, name, mode=None):
     options = {"pixel_format": "nv12"} if fmt == "avfoundation" else {}
     mode = mode or best_mode(camera_modes(index, name))
     lib = avcam_library() if fmt == "avfoundation" else None
-    if lib is not None and mode:
+    if lib is not None and mode and lib.zvp_cam_exists(name.encode("utf-8")):    # 見つからなければ FFmpeg で
         return AvCamCamera(lib, name, mode)
     if mode:
         options["video_size"] = f"{mode[0]}x{mode[1]}"

@@ -5,7 +5,7 @@
 // (4K U3 Camera の 4K は yuvs が後ろで、yuvs では 1 コマも来ない)、開くところで止まる。
 // ここでは大きさと fps が合う形式のうち 420v / 420f (NV12) を優先して選び、NV12 で受け取る。
 //
-// コマは AVFoundation のスレッドで届く。最新の 1 枚だけを持っておき、Python が番号を見て新しければ写す。
+// コマは AVFoundation のスレッドで届く。最新の 1 枚だけを持っておき、Python は新しいコマが届くまで待って写す。
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -40,6 +40,17 @@ static NSArray<AVCaptureDevice *> *all_cameras(void) {
 #pragma clang diagnostic pop
 }
 
+// 名前が一致するカメラ。FFmpeg の一覧の名前は前後の空白が落ちている (「4K U3 Camera 」が「4K U3 Camera」になる)
+// のでそろえて比べる
+static AVCaptureDevice *find_camera(const char *name) {
+    NSCharacterSet *space = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *want = [[NSString stringWithUTF8String:name ?: ""] stringByTrimmingCharactersInSet:space];
+    for (AVCaptureDevice *d in all_cameras()) {
+        if ([[d.localizedName stringByTrimmingCharactersInSet:space] isEqualToString:want]) return d;
+    }
+    return nil;
+}
+
 @interface ZvpCam : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property(nonatomic, strong) AVCaptureSession *session;
 @property(nonatomic, strong) AVCaptureDevice *device;
@@ -48,15 +59,15 @@ static NSArray<AVCaptureDevice *> *all_cameras(void) {
 @end
 
 @implementation ZvpCam {
-    CVPixelBufferRef _latest;       // 最新のコマ (lock で守る)
+    CVPixelBufferRef _latest;       // 最新のコマ (_cond で守る)
     int64_t _seq;                   // 届いたコマの番号 (1 から)
     double _time;                   // 最新のコマの時刻 (秒)
-    NSLock *_lock;
+    NSCondition *_cond;             // 新しいコマが届いたら知らせる
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _lock = [NSLock new];
+        _cond = [NSCondition new];
     }
     return self;
 }
@@ -71,33 +82,39 @@ static NSArray<AVCaptureDevice *> *all_cameras(void) {
     if (!px) return;
     CMTime t = CMSampleBufferGetPresentationTimeStamp(sb);
     CVPixelBufferRetain(px);
-    [_lock lock];
+    [_cond lock];
     if (_latest) CVPixelBufferRelease(_latest);
     _latest = px;
     _seq += 1;
     _time = CMTIME_IS_VALID(t) ? CMTimeGetSeconds(t) : 0.0;
-    [_lock unlock];
+    [_cond broadcast];
+    [_cond unlock];
 }
 
-// 最新のコマの番号・大きさ・時刻。まだ無ければ 0
-- (int64_t)latestWidth:(int *)w height:(int *)h time:(double *)time {
-    [_lock lock];
-    int64_t seq = _seq;
-    if (_latest) {
+// last より新しいコマが届くまで、最長 timeout 秒待つ。新しいコマの番号 (大きさと時刻も)、届かなければ 0、
+// カメラが外れた・止まったら -1 (Python が開き直す)
+- (int64_t)waitAfter:(int64_t)last timeout:(double)timeout width:(int *)w height:(int *)h time:(double *)time {
+    NSDate *until = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    [_cond lock];
+    while (_seq <= last && [_cond waitUntilDate:until]) {
+    }
+    int64_t seq = _seq > last && _latest ? _seq : 0;
+    if (seq) {
         *w = (int)CVPixelBufferGetWidth(_latest);
         *h = (int)CVPixelBufferGetHeight(_latest);
         *time = _time;
     }
-    [_lock unlock];
-    return _latest ? seq : 0;
+    [_cond unlock];
+    if (!seq && (!self.device.isConnected || !self.session.isRunning)) return -1;
+    return seq;
 }
 
 // 最新のコマを NV12 (Y を w×h、続けて CbCr を w×h/2。行の詰め物なし) で dst へ写す。写したコマの番号を返す
 - (int64_t)copyTo:(uint8_t *)dst size:(int64_t)size width:(int)w height:(int)h {
-    [_lock lock];
+    [_cond lock];
     CVPixelBufferRef px = _latest ? CVPixelBufferRetain(_latest) : NULL;
     int64_t seq = _seq;
-    [_lock unlock];
+    [_cond unlock];
     if (!px) return 0;
     int64_t result = -1;
     if ((int)CVPixelBufferGetWidth(px) >= w && (int)CVPixelBufferGetHeight(px) >= h &&
@@ -128,15 +145,9 @@ static NSArray<AVCaptureDevice *> *all_cameras(void) {
 // 失敗したら NULL を返し、err に理由を書く
 EXPORT void *zvp_cam_open(const char *name, int width, int height, double fps, char *err, int errlen) {
     @autoreleasepool {
-        // FFmpeg の一覧の名前は前後の空白が落ちている (「4K U3 Camera 」が「4K U3 Camera」になる) のでそろえて比べる
-        NSCharacterSet *space = [NSCharacterSet whitespaceAndNewlineCharacterSet];
-        NSString *want = [[NSString stringWithUTF8String:name ?: ""] stringByTrimmingCharactersInSet:space];
-        AVCaptureDevice *dev = nil;
-        for (AVCaptureDevice *d in all_cameras()) {
-            if ([[d.localizedName stringByTrimmingCharactersInSet:space] isEqualToString:want]) { dev = d; break; }
-        }
+        AVCaptureDevice *dev = find_camera(name);
         if (!dev) {
-            set_err(err, errlen, [NSString stringWithFormat:@"カメラが見つかりません: %@", want]);
+            set_err(err, errlen, [NSString stringWithFormat:@"カメラが見つかりません: %s", name ?: ""]);
             return NULL;
         }
         // 大きさと fps が合う形式。NV12 (420v / 420f) を優先する
@@ -213,10 +224,17 @@ EXPORT double zvp_cam_fps(void *h) {
     return h ? ((__bridge ZvpCam *)h).fps : 0.0;
 }
 
-// 最新のコマの番号 (まだ無ければ 0) と大きさ・時刻
-EXPORT int64_t zvp_cam_latest(void *h, int *width, int *height, double *time) {
-    if (!h) return 0;
-    return [(__bridge ZvpCam *)h latestWidth:width height:height time:time];
+// last より新しいコマを最長 timeout 秒待つ。新しいコマの番号と大きさ・時刻、届かなければ 0、カメラが外れたら -1
+EXPORT int64_t zvp_cam_wait(void *h, int64_t last, double timeout, int *width, int *height, double *time) {
+    if (!h) return -1;
+    return [(__bridge ZvpCam *)h waitAfter:last timeout:timeout width:width height:height time:time];
+}
+
+// その名前のカメラを AVFoundation で見つけられるか (見つからなければ FFmpeg で読む)
+EXPORT int zvp_cam_exists(const char *name) {
+    @autoreleasepool {
+        return find_camera(name) ? 1 : 0;
+    }
 }
 
 // 最新のコマを NV12 で dst へ写す (width×height に切って)。写したコマの番号、写せなければ -1、まだ無ければ 0
@@ -240,7 +258,7 @@ EXPORT void zvp_cam_close(void *h) {
 
 // ---------- カメラのホワイトバランス (UVC の Processing Unit) ----------
 // macOS には UVC カメラの設定を変える仕組みが無いので、USB の制御要求を直接送る。カメラの使用許可は要らない。
-// カメラは AVFoundation の名前で探し、modelID (「UVC Camera VendorID_13028 ProductID_26232」) の番号と、
+// カメラは AVFoundation の名前で探し (find_camera)、modelID (「UVC Camera VendorID_13028 ProductID_26232」) の番号と、
 // uniqueID (「0x124000032e46678」= 位置 0x12400000 + 番号) の位置で USB の機器を見つける。
 #import <IOKit/IOKitLib.h>
 #import <IOKit/IOCFPlugIn.h>
@@ -255,14 +273,6 @@ typedef struct {
     UInt32 controls;         // Processing Unit の bmControls
 } Uvc;
 
-static AVCaptureDevice *find_camera(const char *name) {
-    NSCharacterSet *space = [NSCharacterSet whitespaceAndNewlineCharacterSet];
-    NSString *want = [[NSString stringWithUTF8String:name ?: ""] stringByTrimmingCharactersInSet:space];
-    for (AVCaptureDevice *d in all_cameras()) {
-        if ([[d.localizedName stringByTrimmingCharactersInSet:space] isEqualToString:want]) return d;
-    }
-    return nil;
-}
 
 static IOReturn uvc_request(Uvc *u, UInt8 type, UInt8 request, UInt8 selector, void *buf, UInt16 len) {
     IOUSBDevRequest q = {type, request, (UInt16)(selector << 8), u->index, len, buf, 0};

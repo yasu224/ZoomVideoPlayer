@@ -141,8 +141,8 @@ class AvCamTest(unittest.TestCase):
     """macOS で AVFoundation から読む側 (player_capture.AvCamCamera)。ライブラリの代わりに作り物を使う。"""
 
     class FakeLib:
-        def __init__(self, frames, opens=True):
-            self.frames, self.opens, self.calls, self.closed = list(frames), opens, [], False
+        def __init__(self, frames, opens=True, unplug=False):
+            self.frames, self.opens, self.unplug, self.calls, self.closed = list(frames), opens, unplug, [], False
             self.seq = 0
 
         def zvp_cam_open(self, name, w, h, fps, err, errlen):
@@ -152,14 +152,20 @@ class AvCamTest(unittest.TestCase):
                 return None
             return 1
 
+        def zvp_cam_exists(self, name):
+            return 1
+
         def zvp_cam_fps(self, handle):
             return 60.00024
 
-        def zvp_cam_latest(self, handle, w, h, t):
-            if self.frames:              # 呼ばれるたびに 1 コマ届いたことにする
-                self.frames.pop(0)
-                self.seq += 1
-                w._obj.value, h._obj.value, t._obj.value = 4, 2, self.seq / 60
+        def zvp_cam_wait(self, handle, last, timeout, w, h, t):
+            import time
+            if not self.frames:          # 届かない: 待った末に 0 (コマの列が尽きたら外れたことにする設定もできる)
+                time.sleep(0.001)
+                return -1 if self.unplug else 0
+            self.frames.pop(0)           # 呼ばれるたびに 1 コマ届いたことにする
+            self.seq += 1
+            w._obj.value, h._obj.value, t._obj.value = 4, 2, self.seq / 60
             return self.seq
 
         def zvp_cam_copy(self, handle, dst, size, w, h):
@@ -200,6 +206,12 @@ class AvCamTest(unittest.TestCase):
         finally:
             player_capture.camera_modes, player_capture.avcam_library = real_modes, real_lib
         self.assertEqual(lib.calls, [(b"cam", 1920, 1080, 60.0), (b"cam", 3840, 2160, 60.0)])
+
+    def test_unplugged_camera_ends_demux(self):
+        """カメラが外れたら demux が終わる (CameraCapture が開き直す)。"""
+        cam = player_capture.AvCamCamera(self.FakeLib([1], unplug=True), "cam", (1920, 1080, 60.0))
+        got = list(cam.demux(cam.streams.video[0]))
+        self.assertEqual([len(p.decode()) for p in got], [1])
 
     def test_open_failure_has_reason(self):
         with self.assertRaisesRegex(OSError, "形式がありません"):
