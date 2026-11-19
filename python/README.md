@@ -65,7 +65,12 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 - **SDI 入力**（DeckLink / UltraStudio）: SDI 出力と同じライブラリ（`build_sdi_mac.sh` / `build_sdi.bat`）で受け取る。
   入力の形式（解像度・fps）は機器が見分けて、変わればそれに合わせる。10bit 4:2:2 のまま受け取り、
   画面・SDI 出力・録画に渡す（Blackmagic の機器はカメラとしても見えるが、10bit で受け取れる SDI 入力として出す）
-- **カメラ**（HDMI キャプチャー機器などを含む）: macOS は AVFoundation、Windows は DirectShow から FFmpeg で受け取る。
+- **カメラ**（HDMI キャプチャー機器などを含む）: macOS は AVFoundation から専用のライブラリ（`cam/libzvp_avcam.dylib`）で、
+  Windows は DirectShow から FFmpeg で受け取る。macOS で FFmpeg を使わないのは、同じ大きさの形式が 2 つ
+  （MJPEG を展開した 420v と、圧縮しない yuvs など）あると FFmpeg は一覧の後ろのものを選び、種類も指定できないため
+  （4K U3 Camera の 4K は後ろの yuvs ではコマが届かず、開くところで止まった）。ライブラリは大きさと fps が合う形式のうち
+  420v を優先して選ぶ。`build_mac.sh` と `run_mac.sh` が `build_cam_mac.sh` で作る（Xcode か Command Line Tools の
+  clang があればよい）。作れなかったときは FFmpeg で受け取る。
   入力の右の「形式」メニューで、機器が知らせてくる解像度・fps（Windows は MJPEG / YUY2 などの形式も）から選べる。
   「自動」では 1080p の 60fps 前後があればそれを選び、無ければいちばん大きい形式（Windows は形式も選び、同じ大きさと fps なら
   MJPEG より圧縮していない形式）。選んだ形式は機器の名前ごとに覚え、次に開いたときも使う（選び直すとカメラを開き直す）。初めて使うときは macOS がカメラの使用許可を求める（Windows はプライバシーの設定で
@@ -150,6 +155,7 @@ DeckLink / UltraStudio（UltraStudio Mini Replay 12G などの再生用の機器
 | `player_os.py` | OS ごとの違いがある処理（画面のスレッドの優先度、裏に回っても OS に遅らせない設定） |
 | `player_sdi.py` | Blackmagic SDI 出力（機器の一覧、送るスレッド、出力の拡大の置き換え） |
 | `sdi/decklink_bridge.cpp`, `build_sdi_mac.sh` / `build_sdi.bat` | DeckLink SDK を呼ぶライブラリとそのビルド（macOS / Windows） |
+| `cam/avcam_bridge.m`, `build_cam_mac.sh` | macOS のカメラを AVFoundation で直接読むライブラリとそのビルド |
 | `tools/check_sdi.py` | SDI 出力の確認（詰め方と、機器へ送れたコマ数） |
 | `tests/`, `run_tests.py`, `run_tests.bat`, `run_tests.sh` | 自動テスト |
 | `tools/check_gpu.py` | 本物の画面での GPU 描画の確認 |

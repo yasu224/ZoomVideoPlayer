@@ -1,4 +1,5 @@
-"""カメラから読む側 (別プロセスで動く。PyAV と numpy だけを使い、Qt は読み込まない)。
+"""カメラから読む側 (別プロセスで動く。PyAV と numpy (macOS は AVFoundation を読むライブラリも) を使い、
+Qt は読み込まない)。
 
 macOS のカメラ (AVFoundation) では、映像が届いていないと FFmpeg はコマが来るまで待ち続け、時間切れの
 指定も効かない。スレッドで読むと止められず、カメラをつかんだまま残ってしまうので、別プロセスで読む。
@@ -9,6 +10,7 @@ macOS のカメラ (AVFoundation) では、映像が届いていないと FFmpeg
 その名前を queue で知らせる。
 """
 import re
+import sys
 import time
 
 from player_os import IS_MAC, IS_WIN, ObjC
@@ -227,6 +229,112 @@ class CameraEffects:
         return names
 
 
+# ---------- macOS: AVFoundation で直接読む (cam/libzvp_avcam.dylib) ----------
+AVCAM_LIB = "libzvp_avcam.dylib"
+_avcam = None
+_avcam_tried = False
+
+
+def avcam_library():
+    """AVFoundation でカメラを読むライブラリ (build_cam_mac.sh で作る)。macOS 以外や、無いときは None。
+
+    FFmpeg (avfoundation) は、同じ大きさの形式が 2 つあると一覧の後ろのものを選び、形式の種類も指定できない。
+    USB カメラによっては後ろの形式ではコマが届かず (4K U3 Camera の 4K)、開くところで止まるので、
+    macOS ではこちらで読む。無ければ FFmpeg で読む。
+    """
+    global _avcam, _avcam_tried
+    if _avcam_tried or not IS_MAC:
+        return _avcam
+    _avcam_tried = True
+    import ctypes
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [os.path.join(base, "cam", AVCAM_LIB) for base in (getattr(sys, "_MEIPASS", None), here) if base]
+    path = next((p for p in paths if os.path.exists(p)), None)
+    if path is None:
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+    except OSError:
+        return None
+    lib.zvp_cam_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_double,
+                                 ctypes.c_char_p, ctypes.c_int]
+    lib.zvp_cam_open.restype = ctypes.c_void_p
+    lib.zvp_cam_fps.argtypes = [ctypes.c_void_p]
+    lib.zvp_cam_fps.restype = ctypes.c_double
+    lib.zvp_cam_latest.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                   ctypes.POINTER(ctypes.c_double)]
+    lib.zvp_cam_latest.restype = ctypes.c_int64
+    lib.zvp_cam_copy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int, ctypes.c_int]
+    lib.zvp_cam_copy.restype = ctypes.c_int64
+    lib.zvp_cam_close.argtypes = [ctypes.c_void_p]
+    _avcam = lib
+    return lib
+
+
+class AvCamFrame:
+    """AVFoundation から届いた最新のコマ (NV12)。write_into で共有メモリのバッファへ直接写す。"""
+
+    class Format:
+        name = "nv12"
+
+    format = Format()
+
+    def __init__(self, camera, width, height, time):
+        self.camera, self.width, self.height, self.time = camera, width, height, time
+
+    def write_into(self, dst, width, height):
+        import ctypes
+        ptr = dst.ctypes.data_as(ctypes.c_void_p)
+        return self.camera.lib.zvp_cam_copy(self.camera.handle, ptr, dst.nbytes, width, height) > 0
+
+
+class AvCamCamera:
+    """AVFoundation で開いたカメラ。FFmpeg で開いたもの (av の container) と同じ使い方ができるようにしてある
+    (CameraCapture.read が streams.video[0] と demux を使う)。コマが届かない間も、止める合図を見られるように
+    POLL_SECONDS ごとに空の知らせを返す。"""
+
+    POLL_SECONDS = 0.002
+
+    class _Packet:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def decode(self):
+            return self.frames
+
+    def __init__(self, lib, name, mode):
+        import ctypes
+        from fractions import Fraction
+        self.lib = lib
+        err = ctypes.create_string_buffer(512)
+        self.handle = lib.zvp_cam_open(name.encode("utf-8"), mode[0], mode[1], float(mode[2]), err, 512)
+        if not self.handle:
+            raise OSError(err.value.decode("utf-8", "replace") or "カメラを開けません")
+        fps = lib.zvp_cam_fps(self.handle)
+        stream = type("Stream", (), {"average_rate": Fraction(fps).limit_denominator(1001) if fps else None,
+                                     "guessed_rate": None})()
+        self.streams = type("Streams", (), {"video": [stream]})()
+        self.last_seq = 0
+
+    def demux(self, stream):
+        import ctypes
+        w, h, t = ctypes.c_int(), ctypes.c_int(), ctypes.c_double()
+        while self.handle:
+            seq = self.lib.zvp_cam_latest(self.handle, ctypes.byref(w), ctypes.byref(h), ctypes.byref(t))
+            if seq > self.last_seq:
+                self.last_seq = seq
+                yield self._Packet([AvCamFrame(self, w.value, h.value, t.value)])
+            else:
+                time.sleep(self.POLL_SECONDS)
+                yield self._Packet([])
+
+    def close(self):
+        if self.handle:
+            self.lib.zvp_cam_close(self.handle)
+            self.handle = None
+
+
 def open_camera(index, name, mode=None):
     """カメラを開く (mode を選んでいればその形式で、無ければ 1080p 60fps 前後があればそれで。NV12 で受け取る)。
 
@@ -238,6 +346,9 @@ def open_camera(index, name, mode=None):
     fmt = camera_format()
     options = {"pixel_format": "nv12"} if fmt == "avfoundation" else {}
     mode = mode or best_mode(camera_modes(index, name))
+    lib = avcam_library() if fmt == "avfoundation" else None
+    if lib is not None and mode:
+        return AvCamCamera(lib, name, mode)
     if mode:
         options["video_size"] = f"{mode[0]}x{mode[1]}"
         options["framerate"] = f"{mode[2]:.6f}".rstrip("0").rstrip(".")
@@ -365,7 +476,10 @@ class CameraCapture:
             if idx < 0:
                 st[S_DROPPED] += 1
                 return
-        write_frame(self.views[idx], frame, fmt, w, h)
+        if hasattr(frame, "write_into"):            # AVFoundation のコマは、共有メモリへ直接写す
+            frame.write_into(self.views[idx], w, h)
+        else:
+            write_frame(self.views[idx], frame, fmt, w, h)
         with st.get_lock():
             st[S_LATEST] = idx
             st[S_LATEST_NO] = st[S_FRAMES]

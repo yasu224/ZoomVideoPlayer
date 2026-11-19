@@ -9,6 +9,8 @@ fi
 .venv/bin/python -m pip install -r requirements.txt pyinstaller
 # SDI 出力用のライブラリ。DeckLink SDK が見つからなければ SDI 出力なしでビルドする
 bash build_sdi_mac.sh || echo "SDI 出力なしでビルドします"
+# カメラを AVFoundation で直接読むライブラリ。作れなければ FFmpeg でカメラを読む (USB カメラの一部の形式が映らない)
+bash build_cam_mac.sh || echo "カメラは FFmpeg で読みます"
 .venv/bin/pyinstaller --noconfirm --clean --distpath dist --workpath build ZoomVideoPlayer.spec
 echo
 echo "ビルド完了: $(pwd)/dist/ZoomVideoPlayer.app"

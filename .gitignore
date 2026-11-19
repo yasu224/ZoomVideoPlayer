@@ -11,6 +11,8 @@ python/sdi/*.dylib
 python/sdi/*.dll
 python/sdi/*.exp
 python/sdi/*.lib
+# カメラを AVFoundation で読むライブラリ (build_cam_mac.sh で作り直せる)
+python/cam/*.dylib
 
 # OS
 .DS_Store
