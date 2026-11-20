@@ -6,6 +6,7 @@ from fractions import Fraction
 import numpy as np
 
 from player_core import (WRAP, VideoSource, even_size, frame_size, gpu_format, hw_device, plane_sizes, plane_views,
+                         probe_hw,
                          texture_scale, write_frame, yuv_planes)
 from player_frames import BackFiller, Decoder, FrameCache, Picture
 from tests.videos import make_video, read_index_frame, read_index_picture, read_index_y
@@ -126,10 +127,13 @@ class SemiFormatTest(unittest.TestCase):
         for semi, planar, bits in self.CASES:
             with self.subTest(semi):
                 w, h = even_size(semi, src.width, src.height)
+                packed = frame.reformat(format=semi)
                 got = np.empty(frame_size(semi, w, h), np.uint8)
-                write_frame(got, frame.reformat(format=semi), semi, w, h)
+                write_frame(got, packed, semi, w, h)
+                # 答えは同じコマ (packed) を並べ替えただけのもの。元のコマから直接プレーン形式にすると、
+                # FFmpeg の変換の道筋が違って色差が 1 段階ずれることがある (確かめたいのは並びの読み方)
                 ref = np.empty(frame_size(planar, w, h), np.uint8)
-                write_frame(ref, frame.reformat(format=planar), planar, w, h)
+                write_frame(ref, packed.reformat(format=planar), planar, w, h)
                 for a, b in zip(yuv_planes(got, semi, w, h), plane_views(ref, planar, w, h)):
                     np.testing.assert_array_equal(a, b)
                 self.assertEqual(read_index_y(yuv_planes(got, semi, w, h)[0] >> (bits - 8)), 21)
@@ -196,8 +200,8 @@ class BackFillerTest(unittest.TestCase):
 class DecoderProcessTest(unittest.TestCase):
     """別プロセスのデコードから共有メモリ経由で正しいコマが順に届く。"""
 
-    def run_session(self, fmt, hw=False):
-        path = make_video(Fraction(120), 300)
+    def run_session(self, fmt, hw=False, crf=0):
+        path = make_video(Fraction(120), 300, crf=crf)
         src = VideoSource(path)
         w, h = even_size(fmt, src.width, src.height)
         src.close()
@@ -264,7 +268,10 @@ class DecoderProcessTest(unittest.TestCase):
         """ハードウェアデコード (NV12) でも、同じコマが順に届く。"""
         if hw_device() is None:
             self.skipTest("この PC ではハードウェアデコードを使えない")
-        self.run_session("nv12", hw=True)
+        # 可逆 (crf=0) の H.264 は GPU では解けないので、普通の (非可逆の) 動画で確かめる
+        if probe_hw(make_video(Fraction(120), 300, crf=18), "yuv420p") is None:
+            self.skipTest(f"この PC のハードウェア ({hw_device()}) では 8bit 4:2:0 の H.264 を解けない")
+        self.run_session("nv12", hw=True, crf=18)
 
 
 if __name__ == "__main__":

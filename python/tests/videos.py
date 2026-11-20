@@ -21,6 +21,8 @@ def make_video(fps=Fraction(120), frames=300, size=(320, 180), gop=60, crf=0, pi
     """フレーム番号入りの H.264 動画を作り、そのパスを返す (同じ条件なら作り直さない)。
 
     crf=0 は可逆。大きい動画で速度を測るときは crf を上げてファイルを小さくする。
+    可逆の H.264 (High 4:4:4 Predictive) は GPU のデコーダーでは解けないので、ハードウェアデコードを
+    確かめるときも crf を上げる。
     pix_fmt="yuv422p10le" で業務用カメラ (XAVC) と同じ 10bit 4:2:2 にできる。
     """
     key = (fps, frames, size, gop, crf, pix_fmt)
@@ -80,11 +82,16 @@ def read_index_frame(av_frame):
     return read_index_y(av_frame.to_ndarray(format="gray"))
 
 
-def make_bars(size=(1920, 1080), fps=Fraction(30), frames=10, pix_fmt="yuv420p"):
-    """色の確認用: 8 本の縦帯 (Y, U, V の値が分かっている) の BT.709 動画。帯の YUV 値 (8bit) も返す。"""
+def make_bars(size=(1920, 1080), fps=Fraction(30), frames=10, pix_fmt="yuv420p", crf=0):
+    """色の確認用: 8 本の縦帯 (Y, U, V の値が分かっている) の BT.709 動画。帯の YUV 値 (8bit) も返す。
+
+    crf=0 は可逆 (High 4:4:4 Predictive)。GPU のデコーダーは可逆の H.264 を解けないので、
+    ハードウェアデコードを確かめるときは crf を上げる (帯は一様な色なので、ほぼ同じ値のまま残る)。
+    """
     folder = os.path.join(tempfile.gettempdir(), "zvp-tests")
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"bars_{size[0]}x{size[1]}_{pix_fmt}.mp4")
+    suffix = f"_crf{crf}" if crf else ""
+    path = os.path.join(folder, f"bars_{size[0]}x{size[1]}_{pix_fmt}{suffix}.mp4")
     bars = [(180, 128, 128), (145, 54, 34), (170, 166, 16), (82, 90, 240),
             (105, 212, 234), (63, 102, 42), (41, 240, 110), (100, 128, 128)]
     w, h = size
@@ -98,7 +105,7 @@ def make_bars(size=(1920, 1080), fps=Fraction(30), frames=10, pix_fmt="yuv420p")
     with av.open(path, "w") as out:
         stream = out.add_stream("libx264", rate=fps)
         stream.width, stream.height, stream.pix_fmt = w, h, pix_fmt
-        stream.options = {"crf": "0", "preset": "ultrafast",
+        stream.options = {"crf": str(crf), "preset": "ultrafast",
                           "x264-params": "colorprim=bt709:transfer=bt709:colormatrix=bt709"}
         for n in range(frames):
             frame = av.VideoFrame.from_ndarray(data, format="yuv420p")
