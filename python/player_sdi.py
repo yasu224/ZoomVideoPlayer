@@ -19,13 +19,11 @@
 送るのは別スレッドで行い、GPU の読み出し用バッファを開いたまま受け取って、機器のコマへ直接写す。
 """
 import ctypes
-import os
-import sys
 import threading
 
 import numpy as np
 
-from player_os import IS_MAC, IS_WIN
+from player_os import IS_MAC, IS_WIN, bundled_file
 
 # ライブラリのファイル名と、それを作るスクリプト (この OS 用。対応していない OS は None)
 LIB_NAME = (("libzvp_decklink.dylib", "build_sdi_mac.sh") if IS_MAC else
@@ -65,15 +63,6 @@ class SdiMode:
         return f"{self.name} ({'10bit' if self.ten_bit else '8bit'})"
 
 
-def _lib_paths(name):
-    here = os.path.dirname(os.path.abspath(__file__))
-    paths = [os.path.join(here, "sdi", name)]
-    base = getattr(sys, "_MEIPASS", None)          # PyInstaller でまとめたとき
-    if base:
-        paths.insert(0, os.path.join(base, "sdi", name))
-    return paths
-
-
 _lib = None
 _lib_error = None
 
@@ -87,7 +76,7 @@ def load_library():
         _lib_error = "SDI 出力は macOS と Windows だけに対応しています"
         return None
     name, script = LIB_NAME
-    path = next((p for p in _lib_paths(name) if os.path.exists(p)), None)
+    path = bundled_file("sdi", name)
     if path is None:
         _lib_error = f"SDI 出力用のライブラリがありません ({script} でビルドしてください)"
         return None
@@ -176,6 +165,8 @@ class SdiOutput:
         self._cond = threading.Condition()
         self._quit = False
         self._thread = None
+        self._done = False            # 送るスレッドが終わった (_cond を持って立てる)
+        self._close_late = False      # 送るスレッドが終わるときに閉じてもらう (close が待ちきれなかったとき)
 
     def open(self):
         lib = load_library()
@@ -229,6 +220,7 @@ class SdiOutput:
 
     def _run(self):
         lib = _lib
+        handle = self._handle            # close が self._handle を消しても、閉じるまでこれを使う
         while True:
             with self._cond:
                 while not self._pending and not self._quit:
@@ -237,12 +229,14 @@ class SdiOutput:
                     for picture in self._pending:
                         picture.finish()
                     self._pending.clear()
-                    return
+                    self._done = True
+                    close_late = self._close_late
+                    break
                 picture = self._pending.pop(0)
             # 機器のコマへ写して予約する。ctypes は呼ぶ間 GIL を手放す
             tag = -1 if picture.tag is None else picture.tag
             try:
-                result = lib.zvp_dl_send(self._handle, picture.address, tag, picture.repeat)
+                result = lib.zvp_dl_send(handle, picture.address, tag, picture.repeat)
             finally:
                 picture.finish()
             if result == 0:
@@ -251,6 +245,8 @@ class SdiOutput:
                 self.dropped += 1
             else:
                 self.error = f"送れませんでした ({result})"
+        if close_late:                   # close が待ちきれなかった: 写し終えたここで閉じる
+            lib.zvp_dl_close(handle)
 
     def repeats(self):
         """(最後の絵を繰り返して出したコマ数, 並べ直した回数)。再生中に増えるのは、新しい絵が
@@ -271,6 +267,13 @@ class SdiOutput:
                 self._cond.notify()
             self._thread.join(timeout=2)
             self._thread = None
+            with self._cond:
+                if not self._done:
+                    # まだ機器のコマへ写している (ドライバが止まったときなど)。ここで閉じると、写している途中の
+                    # コマを手放してしまうので、送るスレッドが終わるときに閉じてもらう
+                    self._close_late = True
+                    self._handle = None
+                    return
         if self._handle:
             _lib.zvp_dl_close(self._handle)
             self._handle = None

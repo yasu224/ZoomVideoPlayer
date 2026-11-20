@@ -79,7 +79,7 @@ def main():
 
     # 1. 色 (8bit 4:2:0 と、業務用カメラと同じ 10bit 4:2:2)。一時停止中 (ソフトでデコード) と、
     #    ハードウェアデコードで再生したコマ (色差を交互に並べた形式) の両方
-    from player_core import YUV_FORMATS, hw_device, yuv_planes
+    from player_core import YUV_FORMATS, hw_device, probe_hw, yuv_planes
 
     def color_error():
         shot = w.view.grabFramebuffer()
@@ -109,6 +109,14 @@ def main():
         fmt, worst = color_error()
         results.append((f"色 {fmt} (BT.709 との最大差)", f"{worst} 段階", worst <= 2))
         if use_hw:
+            # GPU は可逆の H.264 を解けないので、非可逆で作った同じ帯の動画で確かめる
+            path, _ = make_bars(pix_fmt=pix_fmt, crf=18)
+            if probe_hw(path, pix_fmt) is None:
+                # Windows の GPU は H.264 の 10bit を解けない (macOS の VideoToolbox は解ける)。ソフトで解くので問題ない
+                results.append((f"色 HW デコード {pix_fmt}", f"この PC の {hw_device()} では解けない (ソフトで解く)", True))
+                continue
+            w.load(path)
+            wait(0.5)
             # 最後まで再生すると止まり、ハードウェアで解いたコマ (再生用の形式) がそのまま残る
             w.play()
             wait(1.0)

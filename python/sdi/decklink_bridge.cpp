@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -173,6 +174,7 @@ public:
     BMDTimeValue duration = 0;
     BMDTimeScale scale = 0;
     std::mutex lock;
+    bool closed = false;         // 閉じ始めた (コールバックは何もしない。zvp_dl_close が lock を持って立てる)
     int last = -1;               // 最後に予約した絵 (pool の番号)
     int64_t last_slot = -1;      // 最後に予約した出力のコマ番号
     int64_t holds = 0;           // 新しい絵が間に合わず、最後の絵を繰り返して予約したコマ数
@@ -217,6 +219,10 @@ public:
 
     HRESULT ZVP_CALL ScheduledFrameCompleted(IDeckLinkVideoFrame* done, BMDOutputFrameCompletionResult) override {
         std::lock_guard<std::mutex> g(lock);
+        // 閉じている途中で届いた知らせ: SDK は止めたあとも、すでに呼び始めた知らせを終わらせずに戻ることがある。
+        // pool や out はもう手放しているかもしれないので触らない
+        if (closed)
+            return S_OK;
         for (auto& s : pool)
             if (s.frame == done && s.in_use > 0) {
                 s.in_use--;
@@ -483,6 +489,11 @@ ZVP_EXPORT void zvp_dl_close(Output* o) {
     com_init();
     if (!o)
         return;
+    {
+        std::lock_guard<std::mutex> g(o->lock);
+        o->closed = true;            // これより後に届いた完了の知らせは何もしない
+        o->last = -1;
+    }
     BMDTimeValue stopped = 0;
     o->out->StopScheduledPlayback(0, &stopped, 0);
     o->out->SetScheduledFrameCompletionCallback(nullptr);
@@ -493,8 +504,7 @@ ZVP_EXPORT void zvp_dl_close(Output* o) {
             s.frame->Release();
         o->pool.clear();
     }
-    o->out->Release();
-    o->out = nullptr;
+    o->out->Release();               // out は残しておく (o が消えるまで、ほかから読まれても止まらないように)
     o->Release();
 }
 
@@ -543,7 +553,7 @@ void unpack_v210_row(const uint32_t* src, uint16_t* y, uint16_t* uv, int width) 
         unpack_v210_group(src, ty, tuv);
         int n = width - x;
         std::memcpy(y + x, ty, n * sizeof(uint16_t));
-        std::memcpy(uv + x, tuv, ((n + 1) / 2) * 2 * sizeof(uint16_t));
+        std::memcpy(uv + x, tuv, n * sizeof(uint16_t));      // CbCr の行も幅と同じ数 (奇数の幅ではみ出さない)
     }
 }
 
@@ -563,6 +573,9 @@ public:
     std::vector<uint8_t*> bufs;      // Python が用意した P210 のバッファ
     int32_t buf_w = 0, buf_h = 0;
     int held = -1, latest = -1, writing = -1;
+    bool closing = false;            // 閉じ始めた (コールバックは何もしない)
+    int busy = 0;                    // 動いているコールバックの数 (閉じるときは 0 になるのを待つ)
+    std::condition_variable idle;    // writing が -1 になった・busy が減ったときに知らせる
     int64_t latest_no = 0;
     double latest_t = 0;
     std::atomic<int> refs{1};
@@ -576,8 +589,36 @@ public:
         mode_name = to_string(name);
     }
 
+    // コールバックの始めと終わり。閉じ始めていたら false (何もしないで戻る)
+    bool enter() {
+        std::lock_guard<std::mutex> g(lock);
+        if (closing)
+            return false;
+        busy++;
+        return true;
+    }
+    void leave() {
+        {
+            std::lock_guard<std::mutex> g(lock);
+            busy--;
+        }
+        idle.notify_all();
+    }
+    struct Busy {
+        InputCapture* c;
+        bool ok;
+        explicit Busy(InputCapture* c) : c(c), ok(c->enter()) {}
+        ~Busy() {
+            if (ok)
+                c->leave();
+        }
+    };
+
     HRESULT ZVP_CALL VideoInputFormatChanged(BMDVideoInputFormatChangedEvents, IDeckLinkDisplayMode* m,
                                              BMDDetectedVideoInputFormatFlags flags) override {
+        Busy busy_guard(this);
+        if (!busy_guard.ok)          // 閉じている途中で入力を始め直さない
+            return S_OK;
         com_init();
         in->PauseStreams();
         in->EnableVideoInput(m->GetDisplayMode(), bmdFormat10BitYUV, bmdVideoInputEnableFormatDetection);
@@ -592,7 +633,8 @@ public:
     }
 
     HRESULT ZVP_CALL VideoInputFrameArrived(IDeckLinkVideoInputFrame* f, IDeckLinkAudioInputPacket*) override {
-        if (!f)
+        Busy busy_guard(this);
+        if (!f || !busy_guard.ok)    // 閉じている途中: Python のバッファはもう無いかもしれない
             return S_OK;
         int idx = -1;
         int32_t w = (int32_t)f->GetWidth(), h = (int32_t)f->GetHeight();
@@ -640,6 +682,7 @@ public:
         f->GetStreamTime(&t, &d, 1000000);
         std::lock_guard<std::mutex> g(lock);
         writing = -1;
+        idle.notify_all();
         if (!ok) {
             dropped++;
             return S_OK;
@@ -752,11 +795,7 @@ ZVP_EXPORT int zvp_in_set_buffers(InputCapture* c, void** bufs, int n, int32_t w
     if (!c)
         return -1;
     std::unique_lock<std::mutex> g(c->lock);
-    while (c->writing >= 0) {
-        g.unlock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        g.lock();
-    }
+    c->idle.wait(g, [c] { return c->writing < 0; });
     c->bufs.assign((uint8_t**)bufs, (uint8_t**)bufs + n);
     c->buf_w = w;
     c->buf_h = h;
@@ -799,11 +838,18 @@ ZVP_EXPORT void zvp_in_close(InputCapture* c) {
     com_init();
     if (!c)
         return;
+    {
+        // 新しいコールバックを止め、動いているもの (コマをほどいている途中など) が終わるのを待つ。
+        // そのあとは Python のバッファに書かないので、Python が閉じたあとに消しても安全
+        std::unique_lock<std::mutex> g(c->lock);
+        c->closing = true;
+        c->idle.wait(g, [c] { return c->busy == 0; });
+        c->bufs.clear();
+    }
     c->in->StopStreams();
     c->in->SetCallback(nullptr);
     c->in->DisableVideoInput();
-    c->in->Release();
-    c->in = nullptr;
+    c->in->Release();                // in は残しておく (c が消えるまで、ほかから読まれても止まらないように)
     c->Release();
 }
 

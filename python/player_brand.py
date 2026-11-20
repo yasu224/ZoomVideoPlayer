@@ -64,18 +64,6 @@ def draw_logo(p, rect, color):
     p.drawImage(target, img)
 
 
-def logo_pixmap(height, color, dpr=1.0):
-    """高さ height (論理ピクセル) のロゴの画像 (操作パネルのラベル用)。"""
-    w = height * aspect()
-    pm = QPixmap(max(1, round(w * dpr)), max(1, round(height * dpr)))
-    pm.setDevicePixelRatio(dpr)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    draw_logo(p, QRectF(0, 0, w, height), color)
-    p.end()
-    return pm
-
-
 def icon_image(size):
     """size × size のアイコンの絵。"""
     img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)

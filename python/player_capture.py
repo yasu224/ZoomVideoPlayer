@@ -10,13 +10,11 @@ macOS のカメラ (AVFoundation) では、映像が届いていないと FFmpeg
 その名前を queue で知らせる。
 """
 import ctypes
-import os
 import re
-import sys
 import time
 from fractions import Fraction
 
-from player_os import IS_MAC, IS_WIN, ObjC
+from player_os import IS_MAC, IS_WIN, ObjC, bundled_file
 from player_core import attach_shared_memory, even_size, frame_size, gpu_format, unlink_shared_memory, write_frame
 
 BUFFERS = 4           # バッファの数 (表示中・最新・書き込み中 + 予備)
@@ -261,9 +259,7 @@ def avcam_library():
     if _avcam_tried or not IS_MAC:
         return _avcam
     _avcam_tried = True
-    here = os.path.dirname(os.path.abspath(__file__))
-    bases = (getattr(sys, "_MEIPASS", None), here)          # PyInstaller でまとめたときは _MEIPASS の中
-    path = next((p for p in (os.path.join(b, "cam", AVCAM_LIB) for b in bases if b) if os.path.exists(p)), None)
+    path = bundled_file("cam", AVCAM_LIB)
     if path is None:
         return None
     try:
@@ -377,9 +373,9 @@ class AvCamCamera:
 
     def demux(self, stream):
         w, h, t = ctypes.c_int(), ctypes.c_int(), ctypes.c_double()
+        refs = (ctypes.byref(w), ctypes.byref(h), ctypes.byref(t))     # コマごとに作らない
         while self.handle:
-            seq = self.lib.zvp_cam_wait(self.handle, self.last_seq, AVCAM_WAIT,
-                                        ctypes.byref(w), ctypes.byref(h), ctypes.byref(t))
+            seq = self.lib.zvp_cam_wait(self.handle, self.last_seq, AVCAM_WAIT, *refs)
             if seq < 0:                      # カメラが外れた・止まった
                 return
             if seq > self.last_seq:

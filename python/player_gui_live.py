@@ -6,7 +6,7 @@ MainWindow がこのクラスを受け継ぐ。再生の流れ (on_swapped / on_
 import os
 import time
 
-from PySide6.QtCore import QCameraPermission, QSettings, Qt
+from PySide6.QtCore import QCameraPermission, QSettings, QStandardPaths, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 import player_capture as capture
@@ -292,8 +292,7 @@ class LiveMixin:
             self.rec_btn.setChecked(False)
             QMessageBox.warning(self, "録画", "入力に映像が届いていないため、録画を始められません。")
             return
-        default = os.path.join(os.path.expanduser("~/Movies"), time.strftime("ZoomVideoPlayer_%Y%m%d_%H%M%S.mov"))
-        path, _ = QFileDialog.getSaveFileName(self, "録画の保存先", default, "QuickTime (*.mov)")
+        path = self.ask_record_path()
         if not path:
             self.rec_btn.setChecked(False)
             return
@@ -304,6 +303,25 @@ class LiveMixin:
             QMessageBox.warning(self, "録画", f"録画を始められません。\n{e}")
             return
         self.rec_btn.setText("■ 録画停止")
+
+    def ask_record_path(self):
+        """録画の保存先を聞く。入れ物 (MP4 / QuickTime / Matroska) は前に選んだものを初めに選んでおく。"""
+        settings = self.settings()
+        filters = player_live.record_filters()
+        chosen = settings.value("live/record_filter", filters[0])
+        chosen = chosen if chosen in filters else filters[0]
+        ext = player_live.RECORD_FORMATS[filters.index(chosen)][0]
+        # 前に保存したフォルダ。無ければ OS の「ビデオ」(Windows) /「ムービー」(macOS)
+        folder = settings.value("live/record_dir", "") or QStandardPaths.writableLocation(
+            QStandardPaths.MoviesLocation) or os.path.expanduser("~")
+        default = os.path.join(folder, time.strftime("ZoomVideoPlayer_%Y%m%d_%H%M%S") + ext)
+        path, chosen = QFileDialog.getSaveFileName(self, "録画の保存先", default, ";;".join(filters), chosen)
+        if not path:
+            return None
+        path = player_live.record_path(path, chosen)
+        settings.setValue("live/record_filter", chosen)
+        settings.setValue("live/record_dir", os.path.dirname(path))
+        return path
 
     def stop_recording(self):
         recorder, self.recorder = self.recorder, None

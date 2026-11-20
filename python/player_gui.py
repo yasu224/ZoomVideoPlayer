@@ -27,7 +27,7 @@ from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-    QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSizePolicy, QSlider, QStyle, QStyleOptionSlider, QVBoxLayout, QWidget,
 )
 
 COMMON_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60, 119.88, 120, 144, 240]
@@ -108,7 +108,23 @@ class LogoMark(QWidget):
         p.end()
 
 
-class SdiCombo(QComboBox):
+class FitCombo(QComboBox):
+    """文字を省略しないプルダウン: 幅はいちばん長い項目に合わせ、ウィンドウが狭くても縮めない。
+    開いた一覧も、項目がすべて入る幅まで広げる (一覧の幅は標準ではプルダウン自身の幅になる)。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def showPopup(self):
+        view = self.view()
+        need = view.sizeHintForColumn(0) + view.verticalScrollBar().sizeHint().width() + 2 * view.frameWidth()
+        view.setMinimumWidth(need)
+        super().showPopup()
+
+
+class SdiCombo(FitCombo):
     """開くたびに中身を読み直すメニュー (SDI 出力、入力。後からつないだ機器も出るように)。"""
 
     refresh = None
@@ -280,29 +296,28 @@ class MainWindow(LiveMixin, QMainWindow):
         self.input_combo.setFocusPolicy(Qt.NoFocus)
         self.input_combo.setToolTip("動画ファイルの代わりに、カメラや Blackmagic の SDI 入力の映像を表示する")
         self.input_combo.addItem("動画ファイル", None)
-        self.input_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.input_combo.refresh = self.refresh_inputs
         self.input_combo.currentIndexChanged.connect(self.input_changed)
         top.addWidget(self.input_combo)
-        self.mode_combo = QComboBox()
+        self.mode_combo = FitCombo()
         self.mode_combo.setFocusPolicy(Qt.NoFocus)
         self.mode_combo.setToolTip("カメラ (HDMI キャプチャー機器など) から受け取る解像度と fps。\n"
                                    "「自動」は 1080p の 60fps 前後、無ければいちばん大きい形式。選んだ形式は機器ごとに覚える")
-        self.mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.mode_combo.setVisible(False)
         self.mode_combo.currentIndexChanged.connect(self.camera_mode_changed)
         top.addWidget(self.mode_combo)
-        self.cam_wb_combo = QComboBox()
+        self.cam_wb_combo = FitCombo()
         self.cam_wb_combo.setFocusPolicy(Qt.NoFocus)
         self.cam_wb_combo.setToolTip("カメラ自身のホワイトバランス (USB カメラの UVC の設定)。\n"
                                      "映像全体が青や黄色に寄るときは「自動」にするか、照明に合う色温度を選ぶ。\n"
                                      "カメラの中で直すので、画面・SDI 出力・録画のどれにも効く。選んだ設定は機器ごとに覚える")
-        self.cam_wb_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.cam_wb_combo.setVisible(False)
         self.cam_wb_combo.currentIndexChanged.connect(self.camera_wb_changed)
         top.addWidget(self.cam_wb_combo)
         self.name_label = QLabel("")
         self.name_label.setObjectName("dim")
+        # 長いファイル名でもプルダウンを押し縮めないよう、狭いときはこちらが切れる
+        self.name_label.setMinimumWidth(1)
         top.addWidget(self.name_label, 1)
         self.pixel_check = QCheckBox("ピクセル表示")
         self.pixel_check.setFocusPolicy(Qt.NoFocus)
@@ -326,7 +341,6 @@ class MainWindow(LiveMixin, QMainWindow):
         self.sdi_combo.setFocusPolicy(Qt.NoFocus)
         self.sdi_combo.setToolTip("Blackmagic の機器 (DeckLink / UltraStudio) へ、拡大中の絵を出す")
         self.sdi_combo.addItem("オフ", None)
-        self.sdi_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.sdi_combo.refresh = self.refresh_sdi_modes
         self.sdi_combo.currentIndexChanged.connect(self.sdi_changed)
         top.addWidget(self.sdi_combo)
@@ -364,7 +378,7 @@ class MainWindow(LiveMixin, QMainWindow):
         row2.addWidget(QLabel("再生fps"))
         # 標準は動画の fps のまま。値を選ぶと、動画の fps ではなくその fps で 1 コマずつ再生する
         # (59.94fps と記録された 120fps 撮影の映像を 120 で見るときなど)。コマ番号は動画の fps のまま
-        self.fps_combo = QComboBox()
+        self.fps_combo = FitCombo()
         self.fps_combo.setFocusPolicy(Qt.NoFocus)
         self.fps_combo.setToolTip("標準は動画の fps。値を選ぶと、その fps で全コマを再生する (強制)")
         self.fps_combo.addItem("動画のまま", None)
@@ -381,7 +395,7 @@ class MainWindow(LiveMixin, QMainWindow):
             row2.addWidget(w)
         row2.addSpacing(12)
         row2.addWidget(QLabel("速度"))
-        self.speed_combo = QComboBox()
+        self.speed_combo = FitCombo()
         self.speed_combo.setFocusPolicy(Qt.NoFocus)
         for sp in SPEEDS:
             self.speed_combo.addItem(f"{sp}x", sp)
