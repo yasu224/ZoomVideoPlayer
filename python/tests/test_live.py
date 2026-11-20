@@ -560,7 +560,7 @@ class WhiteBalanceTest(unittest.TestCase):
     def test_gray_needs_no_correction(self):
         import numpy as np
         from player_view import white_balance
-        gray = np.repeat(np.linspace(0.05, 0.9, 400)[:, None], 3, 1)
+        gray = np.repeat(np.linspace(0.05, 0.95, 400)[:, None], 3, 1)
         gains, shifts = white_balance(self.samples_of(gray), True, False)
         np.testing.assert_allclose(gains, 1, atol=1e-3)
         np.testing.assert_allclose(shifts, 0, atol=1e-3)
@@ -569,13 +569,24 @@ class WhiteBalanceTest(unittest.TestCase):
         """暗い部分ほど青く、R が沈んでいる (USB カメラで測ったずれ方に近い) 映像も、白から黒まで灰色にそろう。"""
         import numpy as np
         from player_view import white_balance
-        g = np.linspace(0.15, 0.85, 400)
+        g = np.linspace(0.15, 0.95, 400)
         tinted = np.stack([0.9 * g - 0.1, g, 0.85 * g + 0.15], -1)
         samples = self.samples_of(tinted)
         wb = white_balance(samples, True, False)
         self.assertGreater(wb[0][0], 1.0)            # R は上げ、B は黒を沈める
         self.assertLess(wb[1][2], 0.0)
         rgb = self.corrected(samples, wb)
+        np.testing.assert_allclose(rgb[:, 0], rgb[:, 1], atol=1e-3)
+        np.testing.assert_allclose(rgb[:, 2], rgb[:, 1], atol=1e-3)
+
+    def test_dark_picture_is_brightened(self):
+        """露出が低く暗い映像 (明るい所でも 0.5 ほど) は、明るい所が WB_WHITE になるよう持ち上げ、灰色のまま。"""
+        import numpy as np
+        from player_view import WB_WHITE, white_balance
+        gray = np.repeat(np.linspace(0.05, 0.5, 400)[:, None], 3, 1)
+        samples = self.samples_of(gray)
+        rgb = self.corrected(samples, white_balance(samples, True, False))
+        self.assertAlmostEqual(float(np.percentile(rgb[:, 1], 99)), WB_WHITE, delta=1e-3)
         np.testing.assert_allclose(rgb[:, 0], rgb[:, 1], atol=1e-3)
         np.testing.assert_allclose(rgb[:, 2], rgb[:, 1], atol=1e-3)
 

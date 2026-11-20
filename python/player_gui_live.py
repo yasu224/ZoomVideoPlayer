@@ -201,6 +201,7 @@ class LiveMixin:
         self.view.placeholder = f"{source.name}\n映像を待っています…"
         self.set_wb(None)
         # カメラ (macOS が渡す NV12) も SDI も、BT.709 の限定範囲 (16〜235)。前に開いた動画の設定を残さない
+        # (yuvj で届く Windows の MJPEG カメラは、届いたコマを見て live_tick で全範囲に切り替える)
         self.set_view_color(True, False)
         self.camera_wb = None
         if source.device.kind == "camera":
@@ -254,6 +255,11 @@ class LiveMixin:
         if not self.live_frozen:
             picture = self.live.latest()
             if picture is not None:
+                # MJPEG の USB カメラは yuvj (0〜255 の全範囲) で届く。限定範囲として描くと黒が沈んで暗くなる
+                full_range = picture.fmt.startswith("yuvj")
+                if full_range != getattr(self.view, "full_range", full_range):
+                    self.set_view_color(True, full_range)
+                    self.set_wb(None)                # 範囲が変わると自動WB の求め方も変わるので測り直す
                 self.view.set_picture(picture)
                 if self.wb_check.isChecked():
                     self.update_wb(picture)
@@ -361,8 +367,9 @@ class LiveMixin:
         wb = getattr(self.view, "wb", None)
         if not self.wb_check.isChecked() or not wb:
             return ""
-        (r, _, b), (rk, _, bk) = wb
-        return f" ・ 自動WB R×{r:.2f}{rk:+.2f} B×{b:.2f}{bk:+.2f}"
+        (r, g, b), (rk, _, bk) = wb
+        # R・B は明るさの倍率 (G) で割って、色だけの補正を出す
+        return f" ・ 自動WB 明るさ×{g:.2f} R×{r / g:.2f}{rk / g:+.2f} B×{b / g:.2f}{bk / g:+.2f}"
 
     def update_wb(self, picture):
         """コマから補正 (色ごとの倍率とずれ) を求め、少しずつ寄せる (表示と SDI 出力に効く。録画には効かない)。"""
