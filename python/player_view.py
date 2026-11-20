@@ -479,18 +479,22 @@ def yuv_matrix(bt709, full_range, bits=8):
 WB_BANDS = 12          # 明るさ (G) で分ける段の数
 WB_SLOPE = (0.5, 2.0)  # 色ごとの倍率の範囲
 WB_SHIFT = 0.25        # 色ごとのずれ (黒の浮き・沈み) の範囲
+WB_WHITE = 0.9         # 明るい部分 (G の上から 1%) をここまで持ち上げる (暗いカメラの映像を明るくする)
+WB_BRIGHT = 3.0        # 明るさの倍率の上限 (暗くはしない)
 
 
 def white_balance(samples, bt709, full_range, bits=8):
-    """白と黒の色の崩れを直す、R・G・B それぞれの (倍率, ずれ) を求める。補正は c' = 倍率 × c + ずれ。
+    """白と黒の色の崩れと暗さを直す、R・G・B それぞれの (倍率, ずれ) を求める。補正は c' = 倍率 × c + ずれ。
 
     「どの明るさの部分も、平均すれば灰色のはず」とみなす。画素を G の明るさで段に分け、各段の平均の
     R と B が G にそろうような 1 次式を、画素の多い段を重く見て求める。倍率だけでなくずれも直すので、
     暗い部分ほど青い (黒が色づいている) カメラも、白と黒の両方がそろう。
+    露出が低く暗いカメラ向けに、明るい部分 (G の上から 1%) が WB_WHITE になるよう全体を明るくもする。
     samples は yuv_samples の (Y, Cb, Cr) の並び。明るさの幅が狭すぎて求められないときは None。
     """
     m, offset = yuv_matrix(bt709, full_range, bits)
     rgb = (samples - np.array(offset, np.float32)) @ m.reshape(3, 3)     # 各画素の R, G, B
+    bright = float(np.clip(WB_WHITE / max(float(np.percentile(rgb[:, 1], 99)), 1e-3), 1.0, WB_BRIGHT))
     rgb = rgb[rgb.max(1) < 0.98]           # 白飛びした画素は色が分からない
     if len(rgb) < 200:
         return None
@@ -508,7 +512,7 @@ def white_balance(samples, bt709, full_range, bits=8):
         s, k = np.polyfit(means[:, 1], means[:, c], 1, w=np.sqrt(count[use]))
         s, k = float(np.clip(s, *WB_SLOPE)), float(np.clip(k, -WB_SHIFT, WB_SHIFT))
         gains[c], shifts[c] = 1 / s, -k / s
-    return tuple(gains), tuple(shifts)
+    return tuple(g * bright for g in gains), tuple(k * bright for k in shifts)
 
 
 def apply_white_balance(matrix, offset, wb):
