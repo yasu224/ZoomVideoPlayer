@@ -11,6 +11,19 @@ IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
 
 
+def bundled_file(folder, name):
+    """このアプリと一緒に置いたファイル (sdi/ や cam/ のライブラリ) の場所。無ければ None。
+
+    PyInstaller でまとめたときは展開先 (sys._MEIPASS) の中を先に、無ければこのファイルの隣を探す。
+    """
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (getattr(sys, "_MEIPASS", None), here):
+        if base and os.path.exists(path := os.path.join(base, folder, name)):
+            return path
+    return None
+
+
 class ObjC:
     """macOS の Objective-C のランタイムを ctypes で呼ぶ。読めなければ OSError か AttributeError。
 
