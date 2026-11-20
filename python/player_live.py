@@ -9,6 +9,7 @@
 """
 import collections
 import ctypes
+import os
 import queue
 import threading
 import time
@@ -21,6 +22,7 @@ import player_sdi
 from player_capture import camera_names
 from player_core import attach_shared_memory, fill_frame, frame_size, unlink_shared_memory
 from player_frames import Picture
+from player_os import IS_MAC
 
 BUFFERS = capture.BUFFERS    # 入力ごとのバッファの数 (表示中・最新・書き込み中 + 予備)
 
@@ -338,6 +340,25 @@ class CameraInput:
 
 
 # ---------- 録画 ----------
+# 録画の入れ物: (拡張子, 保存の画面に出す名前)。拡張子で入れ物が決まる (FFmpeg が拡張子から選ぶ)。
+# 先頭がその OS の標準 (Windows は MP4、macOS は QuickTime)
+RECORD_FORMATS = ([(".mov", "QuickTime"), (".mp4", "MP4"), (".mkv", "Matroska")] if IS_MAC else
+                  [(".mp4", "MP4"), (".mov", "QuickTime"), (".mkv", "Matroska")])
+
+
+def record_filters():
+    """保存の画面の種類の一覧 (「MP4 (*.mp4)」など)。RECORD_FORMATS と同じ順。"""
+    return [f"{name} (*{ext})" for ext, name in RECORD_FORMATS]
+
+
+def record_path(path, chosen_filter):
+    """保存の画面で選んだ名前に、録画できる拡張子が付いていなければ、選んだ種類の拡張子を付ける。"""
+    if os.path.splitext(path)[1].lower() in [ext for ext, _ in RECORD_FORMATS]:
+        return path
+    filters = record_filters()
+    ext = RECORD_FORMATS[filters.index(chosen_filter)][0] if chosen_filter in filters else RECORD_FORMATS[0][0]
+    return path + ext
+
 # (入力の形式, 書き出し方式, 書き出し方式に渡す形式) の候補。上から使えるものを使う
 ENCODERS = {
     "p210le": [("hevc_videotoolbox", "p210le"), ("libx265", "yuv422p10le"), ("libx264", "yuv422p10le")],
@@ -354,7 +375,8 @@ def pick_encoder(fmt):
 
 
 class Recorder:
-    """入力のコマを .mov に書き出す。書き出しは裏のスレッドで行い、追いつかないコマは捨てて数える。
+    """入力のコマを動画に書き出す (入れ物は path の拡張子: .mp4 / .mov / .mkv)。
+    書き出しは裏のスレッドで行い、追いつかないコマは捨てて数える。
 
     10bit 4:2:2 の SDI 入力は HEVC の 10bit 4:2:2 (Apple シリコンではハードウェアで書き出す) のまま残す。
     音声は録らない。
@@ -375,6 +397,8 @@ class Recorder:
         stream.time_base = 1 / rate
         # 1080p 60fps で 60 Mbps ほど (画素数と fps に比べる)。ソフトの書き出しは速さを優先する
         stream.bit_rate = int(60_000_000 * width * height * float(rate) / (1920 * 1080 * 60))
+        if self.codec.startswith(("hevc", "libx265")) and os.path.splitext(path)[1].lower() in (".mp4", ".mov"):
+            stream.codec_tag = "hvc1"            # Apple の再生ソフト (QuickTime など) は hev1 の HEVC を開けない
         if self.codec == "hevc_videotoolbox" and self.pix == "p210le":
             stream.options = {"profile": "main42210"}
         elif self.codec.startswith("lib"):

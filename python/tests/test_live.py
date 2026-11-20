@@ -470,6 +470,35 @@ class RecorderTest(unittest.TestCase):
             self.assertLess(abs(int(np.median(gu)) - 300), 6)
             self.assertLess(abs(int(np.median(gv)) - 700), 6)
 
+    def test_containers(self):
+        """.mp4 / .mov / .mkv のどれにも書き出せて、読み直せる。HEVC は MP4 / MOV では hvc1 で入れる。"""
+        w, h, n = 64, 32, 10
+        for fmt in ("nv12", "p210le"):
+            if player_live.pick_encoder(fmt) is None:
+                continue
+            data = np.zeros(frame_size(fmt, w, h), np.uint8)
+            for ext, _ in player_live.RECORD_FORMATS:
+                with self.subTest(fmt=fmt, ext=ext):
+                    path = os.path.join(tempfile.mkdtemp(), "rec" + ext)
+                    rec = player_live.Recorder(path, fmt, w, h, Fraction(30))
+                    for i in range(n):
+                        rec.push(Picture(i / 30, fmt, w, h, data))
+                    rec.stop()
+                    self.assertIsNone(rec.error)
+                    with av.open(path) as c:
+                        s = c.streams.video[0]
+                        self.assertEqual(len(list(c.decode(s))), n)
+                        if s.codec_context.name == "hevc" and ext != ".mkv":
+                            self.assertEqual(s.codec_tag, "hvc1")
+
+    def test_record_path(self):
+        """保存の画面で拡張子を付けなかったときは、選んだ種類の拡張子を付ける。"""
+        filters = player_live.record_filters()
+        mkv = filters[[ext for ext, _ in player_live.RECORD_FORMATS].index(".mkv")]
+        self.assertEqual(player_live.record_path("C:/v/a", mkv), "C:/v/a.mkv")
+        self.assertEqual(player_live.record_path("C:/v/a.MOV", mkv), "C:/v/a.MOV")
+        self.assertEqual(player_live.record_path("C:/v/a", "?"), "C:/v/a" + player_live.RECORD_FORMATS[0][0])
+
     def test_drops_other_sizes(self):
         """入力の形式が途中で変わったコマは、録画に入れずに数える。"""
         if player_live.pick_encoder("nv12") is None:
